@@ -22,9 +22,9 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run bot
         env:
-          BOT_TOKEN: 8851798706:AAGb7U485AU-3I8mow93q1XdI0IPC0Kdx54
-          FREE_CHANNEL_ID: -1003948095604
-          VIP_CHANNEL_ID: -1004311060617
-          REF_LINK: https://po-ru4.click/register?utm_campaign=863901&utm_source=affiliate&utm_medium=sr&a=NEymwkbvmUzYeA&al=1792924&ac=pocket_option_regestration1&cid=977852&code=SDS139
-          ADMIN_ID: 239904209 
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          FREE_CHANNEL_ID: ${{ secrets.FREE_CHANNEL_ID }}
+          VIP_CHANNEL_ID: ${{ secrets.VIP_CHANNEL_ID }}
+          REF_LINK: ${{ secrets.REF_LINK }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
         run: python bot.py
