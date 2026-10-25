@@ -266,7 +266,7 @@ keyboard = [
 ]
 await query.message.edit_text(signal_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-Отмена диалога ввода UID
+# Отмена диалога ввода UID
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 await update.message.reply_text("Действие отменено.", reply_markup=None)
