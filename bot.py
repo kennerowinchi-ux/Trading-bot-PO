@@ -456,7 +456,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit(q, text, InlineKeyboardMarkup(kb))
 
 # УБРАНО 4 ПРОБЕЛА СЛЕВА для выравнивания всей цепочки elif
-elif action == "pairs":
+    elif action == "pairs":
     names = list(PAIRS.keys())
     rows = [
         [InlineKeyboardButton(n, callback_data=f"pair:{n}") for n in names[i : i + 2]]
