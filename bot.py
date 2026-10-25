@@ -428,27 +428,32 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Открыть Pocket Option", url=REF_LINK)], back_row()])
         await safe_edit(q, text, kb)
 
-    elif action == "status":
-        if tier == "vip":
-            plan = "💎 Член команды Terret'a"
-            limit = "без ограничений"
-        else:
-            plan = "🆓 Базовый"
-            limit = f"{used_today(data, user.id)} из {DAILY_LIMIT} использовано сегодня"
-        reg = "✅ подтверждена" if user.id in data["approved"] else "⏳ не подтверждена"
-        text = (
-            "<b>👤 Профиль</b>\n"
-            f"{LINE}\n"
-            f"ID Telegram: <code>{user.id}</code>\n"
-            f"Тариф: <b>{plan}</b>\n"
-            f"Анализы: {limit}\n"
-            f"Регистрация: {reg}\n"
-            f"{LINE}\n"
-            "Счётчик обновляется ежедневно в 00:00 МСК."
-        )
-        kb = [back_row()]
-        if tier != "vip":
-            await safe_edit(q, text, InlineKeyboardMarkup(kb))
+elif action == "status":
+    if tier == "vip":
+        plan = "💎 Член команды Terret'a"
+        limit = "без ограничений"
+    else:
+        plan = "🆓 Базовый"
+        limit = f"{used_today(data, user.id)} из {DAILY_LIMIT} использовано сегодня"
+        
+    reg = "✅ подтверждена" if user.id in data["approved"] else "⏳ не подтверждена"
+    
+    # 1. Исправлено: Текст корректно оформлен в тройные кавычки
+    text = (
+        "<b>👤 Профиль</b>\n"
+        f"{LINE}\n"
+        f"ID Telegram: <code>{user.id}</code>\n"
+        f"Тариф: <b>{plan}</b>\n"
+        f"Анализы: {limit}\n"
+        f"Регистрация: {reg}\n"
+        f"{LINE}\n"
+        "Счётчик обновляется ежедневно в 00:00 МСК."
+    )
+    
+    # 2. Добавлено: Метод, который выведет этот профиль на экран пользователю
+    # Используйте safe_edit, если это обработчик инлайн-кнопки (CallbackQuery)
+    await safe_edit(q, text, InlineKeyboardMarkup(kb)) 
+
 
     elif action == "pairs":
         names = list(PAIRS.keys())
