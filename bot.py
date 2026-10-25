@@ -94,7 +94,7 @@ async def user_tier(bot, user_id: int) -> str:
     return "none"
 
 
-# ======================= АНАЛИЗ (Модифицирован под 50/50 и Pocket Option) =======================
+# ======================= АНАЛИЗ (50/50 и Pocket Option) =======================
 def analyze_df(df: pd.DataFrame) -> dict:
     """Ровно в 50% случаев генерирует сигнал UP или DOWN, подстраивая индикаторы под результат."""
     close = df["Close"]
@@ -265,7 +265,7 @@ async def safe_edit(q, text: str, kb: InlineKeyboardMarkup | None = None):
         await q.edit_message_text(
             text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
         )
-except BadRequest as e:
+    except BadRequest as e:
 if "not modified" not in str(e).lower():
 raise
 
