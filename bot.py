@@ -448,7 +448,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         kb = [back_row()]
         if tier != "vip":
-        await safe_edit(q, text, InlineKeyboardMarkup(kb))
+            await safe_edit(q, text, InlineKeyboardMarkup(kb))
 
     elif action == "pairs":
         names = list(PAIRS.keys())
