@@ -242,7 +242,7 @@ METHOD = (
     "Алгоритм не использует «интуицию» — он опирается на консилиум из 5 независимых технических индикаторов, которые оценивают график Pocket Option каждую секунду.  "
     "В системе 50/50 у индикаторов нет нейтральной зоны (0). Каждый из них обязан вынести четкий вердикт: рынок идет ВВЕРХ (+1) или ВНИЗ (-1).\n\n"
     "<b>2. Индикаторы.</b> ⚖️ КАК ГОЛОСУЮТ СУДЬИ:\n"
-    "1️⃣ EMA 9/21 (Тренд) — определяет генеральное направление цены. Если быстрая скользящая выше медленной — голос за РОСТ.n"
+    "1️⃣ EMA 9/21 (Тренд) — определяет генеральное направление цены. Если быстрая скользящая выше медленной — голос за РОСТ.\n"
     "2️⃣ RSI 14 (Импульс) — делит рынок пополам. Если индекс выше 50%, значит, инициатива и крупные деньги у покупателей.\n"
     "3️⃣ MACD Hist (Моментум) — замеряет скорость. Если гистограмма зашла выше нуля, значит, движение ускоряется вверх.\n"
     "4️⃣ Bollinger Bands (Коридор) — оценивает зоны. Если цена закрепилась выше средней линии коридора, она находится в бычьей зоне.\n"
@@ -417,21 +417,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "<b>🔗 Регистрация на Pocket Option</b>\n"
             f"{LINE}\n"
-            "Это партнёрская ссылка автора бота: при регистрации по ней автор может "
-            "получать вознаграждение от брокера. Для вас условия не меняются.\n\n"
+            "Это ссылка автора бота для получения информации о вас: при регистрации по ней, автор проверяет "
+            "наличие активности от вас, как трейдера.\n\n"
             "<b>Порядок действий</b>\n"
             "1. Откройте ссылку и создайте аккаунт.\n"
             "2. Скопируйте свой ID из профиля Pocket Option.\n"
             "3. Отправьте боту: <code>/uid 12345678</code>\n"
             "4. Дождитесь подтверждения — статус появится в разделе «Профиль».\n\n"
-            "<i>Начните с демо-счёта и не вкладывайте средства, которые не готовы потерять.</i>"
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Открыть Pocket Option", url=REF_LINK)], back_row()])
         await safe_edit(q, text, kb)
 
     elif action == "status":
         if tier == "vip":
-            plan = "💎 VIP"
+            plan = "💎 Член команды Terret'a"
             limit = "без ограничений"
         else:
             plan = "🆓 Базовый"
@@ -449,7 +448,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         kb = [back_row()]
         if tier != "vip":
-            kb.insert(0, [InlineKeyboardButton("💎 Перейти на VIP", url=VIP_CHANNEL_URL)])
         await safe_edit(q, text, InlineKeyboardMarkup(kb))
 
     elif action == "pairs":
@@ -481,7 +479,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>📊 {pair}</b>\n"
             f"{LINE}\n"
             "Шаг 2 из 2 — выберите таймфрейм.\n\n"
-            "<i>Чем меньше таймфрейм, тем больше рыночного шума и ложных сигналов.</i>",
+            "<i>Таймфрейм - Время, на которое вы входите в сделку.</i>",
             InlineKeyboardMarkup(kb),
         )
 
@@ -503,8 +501,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Для работы без ограничений подключите VIP-доступ.",
                 InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("💎 VIP-канал", url=VIP_CHANNEL_URL)],
-                        [InlineKeyboardButton("💬 Связаться с автором", url=f"https://t.me/{CONTACT_USERNAME}")],
+                        [InlineKeyboardButton("💬 Связаться с автором", url=f"https://t.me/https://t.me/Terret911")],
                         back_row(),
                     ]
                 ),
