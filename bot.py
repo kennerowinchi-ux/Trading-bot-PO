@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
@@ -45,6 +45,10 @@ TIMEFRAMES = {
     "1m": ("M1", "1 мин", 25),
     "3m": ("M3", "3 мин", 50),
 }
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMG_UP = os.path.join(BASE_DIR, "up.png")      # зелёное фото: график вверх
+IMG_DOWN = os.path.join(BASE_DIR, "down.png")  # красное фото: график вниз
 
 LINE = "━━━━━━━━━━━━━━━━━━"
 
@@ -288,6 +292,16 @@ LOCKED = (
 
 
 async def safe_edit(q, text: str, kb: InlineKeyboardMarkup | None = None):
+    # Фото-сообщение нельзя превратить в текстовое: удаляем его и шлём обычное сообщение.
+    if q.message is not None and q.message.photo:
+        await q.message.chat.send_message(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
+        )
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        return
     try:
         await q.edit_message_text(
             text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
@@ -295,6 +309,30 @@ async def safe_edit(q, text: str, kb: InlineKeyboardMarkup | None = None):
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             raise
+
+
+async def show_result(q, text: str, kb: InlineKeyboardMarkup, direction: str):
+    """Результат анализа с фото: зелёное для ВВЕРХ, красное для ВНИЗ."""
+    path = IMG_UP if direction == "UP" else IMG_DOWN
+    if not os.path.exists(path):
+        await safe_edit(q, text, kb)
+        return
+    if q.message is not None and q.message.photo:
+        try:
+            with open(path, "rb") as f:
+                await q.edit_message_media(
+                    InputMediaPhoto(f, caption=text, parse_mode=ParseMode.HTML), reply_markup=kb
+                )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                raise
+        return
+    with open(path, "rb") as f:
+        await q.message.chat.send_photo(f, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
 
 
 # ======================= КОМАНДЫ =======================
@@ -372,6 +410,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = load_data()
     action = q.data
+
+    # Анализ рынка доступен только после подтверждения регистрации администратором
+    needs_approval = action == "pairs" or action.startswith("pair:") or action.startswith("sig:")
+    if needs_approval and user.id not in data["approved"] and user.id != ADMIN_ID:
+        await safe_edit(
+            q,
+            "<b>🔒 Анализ рынка недоступен</b>\n"
+            f"{LINE}\n"
+            "Ваша регистрация ещё не подтверждена администратором.\n\n"
+            "<b>Что сделать</b>\n"
+            "1. Зарегистрируйтесь по ссылке в разделе «Регистрация».\n"
+            "2. Отправьте боту свой ID: <code>/uid 12345678</code>\n"
+            "3. Дождитесь подтверждения — после этого анализ откроется.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔗 Регистрация", callback_data="ref")], back_row()]
+            ),
+        )
+        return
 
     if action == "menu":
         await safe_edit(q, WELCOME, main_menu())
@@ -472,7 +528,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tf_name, expiry, _ = TIMEFRAMES[tf]
-        await safe_edit(q, f"⏳ <b>{pair} · {tf_name}</b>\nЗагружаю котировки и считаю индикаторы…")
+        if not (q.message is not None and q.message.photo):
+            await safe_edit(q, f"⏳ <b>{pair} · {tf_name}</b>\nЗагружаю котировки и считаю индикаторы…")
 
         try:
             res = await asyncio.to_thread(fetch_and_analyze, PAIRS[pair], tf)
@@ -506,10 +563,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         strength = "идеальный" if abs(res["score"]) == 5 else "стандартный"
-        if res["direction"] == "UP":
-            head = "🟢 <b>ВВЕРХ</b>  ·  CALL  ▲"
-        else:
-            head = "🔴 <b>ВНИЗ</b>  ·  PUT  ▼"
+        verdict = "🟢 <b>ВВЕРХ</b>" if res["direction"] == "UP" else "🔴 <b>ВНИЗ</b>"
 
         now = datetime.now(TZ).strftime("%d.%m.%Y · %H:%M:%S МСК")
         if tier == "vip":
@@ -521,11 +575,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>📊 {pair}</b>  ·  <b>{tf_name}</b>\n"
             f"🕒 <code>{now}</code>\n"
             f"{LINE}\n\n"
-            f"{head}\n"
-            f"Сигнал: <b>{strength}</b>\n"
-            f"Голоса: {dots}  <b>{res['up']}:{res['down']}</b>  (счёт {res['score']:+d})\n\n"
+            f"{verdict}\n\n"
             f"{LINE}\n"
             f"<b>ИНДИКАТОРЫ</b>\n\n{votes_txt}\n\n"
+            f"Голоса: {dots}  <b>{res['up']}:{res['down']}</b>  ·  сигнал {strength}\n"
             f"{LINE}\n"
             f"💱 Цена: <code>{res['price']:.{decimals}f}</code>\n"
             f"📈 Волатильность: {res['volatility']}\n"
@@ -546,7 +599,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ],
             ]
         )
-        await safe_edit(q, text, kb)
+        await show_result(q, text, kb, res["direction"])
 
 
 def main():
