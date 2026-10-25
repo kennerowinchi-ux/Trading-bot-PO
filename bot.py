@@ -439,17 +439,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reg = "✅ подтверждена" if user.id in data["approved"] else "⏳ не подтверждена"
         # дальше формируете text и вызываете safe_edit
     
-    # 1. Исправлено: Текст корректно оформлен в тройные кавычки
-    text = (
-        "<b>👤 Профиль</b>\n"
-        f"{LINE}\n"
-        f"ID Telegram: <code>{user.id}</code>\n"
-        f"Тариф: <b>{plan}</b>\n"
-        f"Анализы: {limit}\n"
-        f"Регистрация: {reg}\n"
-        f"{LINE}\n"
-        "Счётчик обновляется ежедневно в 00:00 МСК."
-    )
     
     # 1. Исправлено: Текст корректно оформлен в тройные кавычки
     text = (
