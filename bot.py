@@ -466,7 +466,7 @@ elif action == "pairs":
     await safe_edit(q, "Выберите пару:", InlineKeyboardMarkup(rows))
 
 # УБРАНО 4 ПРОБЕЛА СЛЕВА для выравнивания всей цепочки elif
-elif action.startswith("pair:"):
+    elif action.startswith("pair:"):
     pair = action[5:]
     if pair not in PAIRS:
         return
