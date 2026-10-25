@@ -1,0 +1,30 @@
+name: Telegram bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.8851798706:AAGb7U485AU-3I8mow93q1XdI0IPC0Kdx54}}
+          FREE_CHANNEL_ID: ${{ secrets.https://t.me/+F_OldsGjeK5lMjBi }}
+          VIP_CHANNEL_ID: ${{ secrets.https://t.me/+itYuwMLRnBcyNDEy }}
+          REF_LINK: ${{ secrets.https://po-ru4.click/register?utm_campaign=863901&utm_source=affiliate&utm_medium=sr&a=NEymwkbvmUzYeA&al=1792924&ac=pocket_option_regestration1&cid=977852&code=SDS139 }}
+          ADMIN_ID: ${{ secrets.6239904209 }}
+        run: python bot.py
