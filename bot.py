@@ -49,6 +49,8 @@ TIMEFRAMES = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMG_UP = os.path.join(BASE_DIR, "up.png")      # зелёное фото: график вверх
 IMG_DOWN = os.path.join(BASE_DIR, "down.png")  # красное фото: график вниз
+IMG_APPROVED = os.path.join(BASE_DIR, "approved.png")  # заявка одобрена
+IMG_REJECTED = os.path.join(BASE_DIR, "rejected.png")  # заявка отклонена
 
 LINE = "━━━━━━━━━━━━━━━━━━"
 
@@ -424,8 +426,13 @@ async def decide(bot, uid: int, approved: bool) -> bool:
             "Отправьте ID заново: <code>/uid 12345678</code>"
         )
     save_data(data)
+    img = IMG_APPROVED if approved else IMG_REJECTED
     try:
-        await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+        if os.path.exists(img):
+            with open(img, "rb") as f:
+                await bot.send_photo(uid, f, caption=text, parse_mode=ParseMode.HTML)
+        else:
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
         return True
     except Exception as e:
         log.warning("Не удалось уведомить пользователя %s: %s", uid, e)
