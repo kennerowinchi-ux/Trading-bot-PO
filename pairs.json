@@ -1,0 +1,10 @@
+{
+  "EUR/USD": "EURUSD=X",
+  "GBP/USD": "GBPUSD=X",
+  "USD/JPY": "JPY=X",
+  "AUD/USD": "AUDUSD=X",
+  "USD/CAD": "CAD=X",
+  "USD/CHF": "CHF=X",
+  "EUR/JPY": "EURJPY=X",
+  "EUR/GBP": "EURGBP=X"
+}
