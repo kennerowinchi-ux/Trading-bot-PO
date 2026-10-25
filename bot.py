@@ -304,7 +304,6 @@ def subscribe_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📢 Основной канал", url=FREE_CHANNEL_URL)],
-            [InlineKeyboardButton("💎 VIP-канал", url=VIP_CHANNEL_URL)],
             [InlineKeyboardButton("✅ Проверить подписку", callback_data="menu")],
         ]
     )
@@ -313,11 +312,11 @@ def subscribe_keyboard() -> InlineKeyboardMarkup:
 LOCKED = (
     "<b>🔒 Доступ ограничен</b>\n"
     f"{LINE}\n"
-    "Для работы с терминалом необходима подписка на канал автора.\n\n"
-    "1. Подпишитесь на канал.\n"
+    "Для того что бы начать работать по торговому боту, вам необходимо подписаться на канал блогера Terret.\n\n"
+    "1. Перейдите в канал "Влог Террета" и подпишитесь\n"
     "2. Нажмите «Проверить подписку».\n\n"
     "▫️ Основной канал — 10 анализов в сутки\n"
-    "▫️ VIP-канал — без ограничений"
+    "▫️ VIP-Доступ - Только для людей, состоящих в команде Террета"
 )
 
 
