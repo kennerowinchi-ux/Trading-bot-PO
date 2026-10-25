@@ -453,8 +453,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # 2. Добавлено: Метод, который выведет этот профиль на экран пользователю
     # Используйте safe_edit, если это обработчик инлайн-кнопки (CallbackQuery)
-    await safe_edit(q, text, InlineKeyboardMarkup(kb)) 
-
+  await safe_edit(q, text, InlineKeyboardMarkup(kb))
 
     elif action == "pairs":
         names = list(PAIRS.keys())
@@ -463,13 +462,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i in range(0, len(names), 2)
         ]
         rows.append(back_row())
-        await safe_edit(
-            q,
-            "<b>📊 Новый анализ</b>\n"
-            f"{LINE}\n"
-            "Шаг 1 из 2 — выберите валютную пару:",
-            InlineKeyboardMarkup(rows),
-        )
+        await safe_edit(q, "Выберите пару:", InlineKeyboardMarkup(rows))
 
     elif action.startswith("pair:"):
         pair = action[5:]
