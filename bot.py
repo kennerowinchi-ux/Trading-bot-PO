@@ -32,6 +32,11 @@ TZ = ZoneInfo("Europe/Moscow")
 DATA_FILE = "data.json"
 CACHE_TTL = 45  # секунд
 
+# --- параметры системы 50/50 ---
+MIN_SCORE = 3   # минимальный перевес голосов для сигнала (1, 3 или 5)
+ATR_MIN = 0.6   # ниже — «мёртвый» рынок, сигнал отклоняется
+ATR_MAX = 1.8   # выше — «шторм», сигнал отклоняется
+
 with open("pairs.json", encoding="utf-8") as f:
     PAIRS = json.load(f)  # {"EUR/USD": "EURUSD=X", ...}
 
@@ -95,12 +100,11 @@ async def user_tier(bot, user_id: int) -> str:
 
 # ======================= АНАЛИЗ =======================
 def analyze_df(df: pd.DataFrame) -> dict:
-    """Расчёт пяти индикаторов. Каждый голосует: +1 (вверх), -1 (вниз), 0 (нейтрально)."""
+    """Система 50/50: 5 судей, каждый голосует только +1 или -1. Сумма всегда нечётная (±1, ±3, ±5)."""
     close, high, low = df["Close"], df["High"], df["Low"]
 
     ema9 = close.ewm(span=9, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
 
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
@@ -111,8 +115,6 @@ def analyze_df(df: pd.DataFrame) -> dict:
     hist = macd - macd.ewm(span=9, adjust=False).mean()
 
     mid = close.rolling(20).mean()
-    std = close.rolling(20).std()
-    upper, lower = mid + 2 * std, mid - 2 * std
 
     ll, hh = low.rolling(14).min(), high.rolling(14).max()
     stoch = (100 * (close - ll) / (hh - ll).replace(0, np.nan)).rolling(3).mean()
@@ -122,55 +124,44 @@ def analyze_df(df: pd.DataFrame) -> dict:
     atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
     atr_ratio = float(atr.iloc[-1] / atr.rolling(50).mean().iloc[-1])
 
+    price = float(close.iloc[-1])
     votes = []
 
-    e9, e21, e50 = float(ema9.iloc[-1]), float(ema21.iloc[-1]), float(ema50.iloc[-1])
-    if e9 > e21 > e50:
-        votes.append(("Тренд · EMA 9/21/50", "восходящая структура", 1))
-    elif e9 < e21 < e50:
-        votes.append(("Тренд · EMA 9/21/50", "нисходящая структура", -1))
-    else:
-        votes.append(("Тренд · EMA 9/21/50", "смешанная структура", 0))
+    e9, e21 = float(ema9.iloc[-1]), float(ema21.iloc[-1])
+    votes.append(("Тренд · EMA 9/21", "быстрая выше медленной" if e9 > e21 else "быстрая ниже медленной",
+                  1 if e9 > e21 else -1))
 
     r = float(rsi.iloc[-1])
-    if r < 35:
-        votes.append(("Импульс · RSI(14)", f"{r:.1f} — зона перепроданности", 1))
-    elif r > 65:
-        votes.append(("Импульс · RSI(14)", f"{r:.1f} — зона перекупленности", -1))
-    else:
-        votes.append(("Импульс · RSI(14)", f"{r:.1f} — нейтральная зона", 0))
+    if np.isnan(r):
+        r = 50.0
+    votes.append(("Импульс · RSI(14)",
+                  f"{r:.1f} — " + ("инициатива у покупателей" if r > 50 else "инициатива у продавцов"),
+                  1 if r > 50 else -1))
 
-    h_now, h_prev = float(hist.iloc[-1]), float(hist.iloc[-2])
-    if h_now > 0 and h_now > h_prev:
-        votes.append(("Моментум · MACD", "гистограмма > 0 и растёт", 1))
-    elif h_now < 0 and h_now < h_prev:
-        votes.append(("Моментум · MACD", "гистограмма < 0 и падает", -1))
-    else:
-        votes.append(("Моментум · MACD", "нет подтверждённого направления", 0))
+    h = float(hist.iloc[-1])
+    votes.append(("Моментум · MACD", "гистограмма выше нуля" if h > 0 else "гистограмма ниже нуля",
+                  1 if h > 0 else -1))
 
-    price = float(close.iloc[-1])
-    if price < float(lower.iloc[-1]):
-        votes.append(("Волатильность · Bollinger", "цена ниже нижней границы", 1))
-    elif price > float(upper.iloc[-1]):
-        votes.append(("Волатильность · Bollinger", "цена выше верхней границы", -1))
-    else:
-        votes.append(("Волатильность · Bollinger", "цена внутри канала", 0))
+    m = float(mid.iloc[-1])
+    votes.append(("Коридор · Bollinger", "цена выше средней линии" if price > m else "цена ниже средней линии",
+                  1 if price > m else -1))
 
     s = float(stoch.iloc[-1])
-    if s < 20:
-        votes.append(("Осциллятор · Stochastic", f"{s:.1f} — перепроданность", 1))
-    elif s > 80:
-        votes.append(("Осциллятор · Stochastic", f"{s:.1f} — перекупленность", -1))
-    else:
-        votes.append(("Осциллятор · Stochastic", f"{s:.1f} — нейтральная зона", 0))
+    if np.isnan(s):
+        s = 50.0
+    votes.append(("Осциллятор · Stochastic", f"{s:.1f} — " + ("сила быков" if s > 50 else "сила медведей"),
+                  1 if s > 50 else -1))
 
     score = sum(v for _, _, v in votes)
-    if score >= 2:
-        direction = "UP"
-    elif score <= -2:
-        direction = "DOWN"
+
+    if atr_ratio < ATR_MIN:
+        direction, reason = "SKIP", "рынок «мёртвый» (волатильность слишком низкая)"
+    elif atr_ratio > ATR_MAX:
+        direction, reason = "SKIP", "аномальный шторм (волатильность слишком высокая)"
+    elif abs(score) < MIN_SCORE:
+        direction, reason = "SKIP", "перевес судей недостаточный"
     else:
-        direction = "NEUTRAL"
+        direction, reason = ("UP" if score > 0 else "DOWN"), ""
 
     if atr_ratio < 0.8:
         vol = "низкая"
@@ -184,9 +175,9 @@ def analyze_df(df: pd.DataFrame) -> dict:
         "votes": votes,
         "score": score,
         "direction": direction,
+        "reason": reason,
         "up": sum(1 for _, _, v in votes if v > 0),
         "down": sum(1 for _, _, v in votes if v < 0),
-        "flat": sum(1 for _, _, v in votes if v == 0),
         "volatility": vol,
     }
 
@@ -200,18 +191,23 @@ def fetch_and_analyze(ticker: str, interval: str) -> dict | None:
     if hit and time.time() - hit[0] < CACHE_TTL:
         return hit[1]
 
-    df = yf.download(ticker, period="5d", interval=interval, progress=False, auto_adjust=True)
+    # yfinance не умеет интервалы 30s и 3m: качаем минутные свечи,
+    # для 30S берём M1 как есть, для M3 собираем свечи по 3 минуты.
+    df = yf.download(ticker, period="5d", interval="1m", progress=False, auto_adjust=True)
     if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.dropna(subset=["Close", "High", "Low"])
-    if len(df) < 60:
-        return None
 
     last = df.index[-1]
     last = last.tz_localize("UTC") if last.tzinfo is None else last.tz_convert("UTC")
     age_min = (pd.Timestamp.now(tz="UTC") - last).total_seconds() / 60
+
+    if interval == "3m":
+        df = df.resample("3min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+    if len(df) < 60:
+        return None
 
     result = analyze_df(df)
     result["age_min"] = age_min
@@ -222,15 +218,7 @@ def fetch_and_analyze(ticker: str, interval: str) -> dict | None:
 
 # ======================= ТЕКСТЫ =======================
 WELCOME = (
-    "<b>📈 Syndicate Signals — аналитический инструмент</b>\n"
-    f"{LINE}\n"
-    "Технический анализ валютных пар Pocket Option по рыночным котировкам: "
-    "пять индикаторов, три таймфрейма, прозрачная методика.\n\n"
-    "<b>Уровни доступа</b>\n"
-    "▫️ Базовый — <b>10 анализов в сутки</b>\n"
-    "▫️ VIP — <b>без ограничений</b>\n\n"
-    "<i>Бот — аналитический инструмент, для помощи новым трейдерам. Он просчитывает вероятности и "
-    "выдает самое оптимальное направление рынка.</i>\n"
+    "<b>📈 Система 50/50</b>\n"
     f"{LINE}\n"
     "Выберите раздел:"
 )
@@ -250,9 +238,9 @@ METHOD = (
     "<b>3. Голосование.</b> 🚀 СИЛА СИГНАЛА: "
     "Счет +5 или -5 — Идеальный сигнал. Все судьи единогласны. Вероятность 50/50 капитулирует перед математическим перевесом.\n\n"
     "Счет +3 или -3 — Стандартный сигнал. Большинство судей перевесило чашу весов.\n\n"
-    "<b>4. Сигнал.</b> Направление указывается при балансе не менее ±2. "
+    "<b>4. Сигнал.</b> Направление указывается при балансе не менее ±3. "
     "Фильтр ATR: Перед отправкой бот проверяет датчик волатильности (ATR). При аномальном шторме или «мертвом» рынке сигнал будет автоматически отклонен ради безопасности вашего депозита.\n\n"
-    "<b>5. Экспирация.</b> Мы пользуемся тремя видами таймфрема (15S,1M,3M). "
+    "<b>5. Экспирация.</b> Мы пользуемся тремя видами таймфрема (30S, M1, M3). "
     "На личном опыте я выделили именно эти три таймфрейма\n\n"
     f"{LINE}"
 )
@@ -269,12 +257,6 @@ RISKS = (
     "▫️ Данная комиссия это символическая комиссия за мою работу, благодарю за понимание\n"
     f"{LINE}"
 )
-
-SHORT_DISCLAIMER = (
-    "<i>⚠️ Информационный материал, не инвестиционная рекомендация. "
-    "Результат не гарантирован. Подробнее — в разделе «Риски».</i>"
-)
-
 
 # ======================= КЛАВИАТУРЫ =======================
 def main_menu() -> InlineKeyboardMarkup:
@@ -437,52 +419,45 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit = f"{used_today(data, user.id)} из {DAILY_LIMIT} использовано сегодня"
 
         reg = "✅ подтверждена" if user.id in data["approved"] else "⏳ не подтверждена"
-        # дальше формируете text и вызываете safe_edit
-    
-    
-    # 1. Исправлено: Текст корректно оформлен в тройные кавычки
-    text = (
-        "<b>👤 Профиль</b>\n"
-        f"{LINE}\n"
-        f"ID Telegram: <code>{user.id}</code>\n"
-        f"Тариф: <b>{plan}</b>\n"
-        f"Анализы: {limit}\n"
-        f"Регистрация: {reg}\n"
-        f"{LINE}\n"
-        "Счётчик обновляется ежедневно в 00:00 МСК."
-    )
-    
-    # 2. ДОБАВЛЕНО 2 ПРОБЕЛА (теперь код внутри блока статуса)
-    await safe_edit(q, text, InlineKeyboardMarkup(kb))
 
-# УБРАНО 4 ПРОБЕЛА СЛЕВА для выравнивания всей цепочки elif
+        text = (
+            "<b>👤 Профиль</b>\n"
+            f"{LINE}\n"
+            f"ID Telegram: <code>{user.id}</code>\n"
+            f"Тариф: <b>{plan}</b>\n"
+            f"Анализы: {limit}\n"
+            f"Регистрация: {reg}\n"
+            f"{LINE}\n"
+            "Счётчик обновляется ежедневно в 00:00 МСК."
+        )
+        await safe_edit(q, text, InlineKeyboardMarkup([back_row()]))
+
     elif action == "pairs":
-    names = list(PAIRS.keys())
-    rows = [
-        [InlineKeyboardButton(n, callback_data=f"pair:{n}") for n in names[i : i + 2]]
-        for i in range(0, len(names), 2)
-    ]
-    rows.append(back_row())
-    await safe_edit(q, "Выберите пару:", InlineKeyboardMarkup(rows))
+        names = list(PAIRS.keys())
+        rows = [
+            [InlineKeyboardButton(n, callback_data=f"pair:{n}") for n in names[i : i + 2]]
+            for i in range(0, len(names), 2)
+        ]
+        rows.append(back_row())
+        await safe_edit(q, "Выберите пару:", InlineKeyboardMarkup(rows))
 
-# УБРАНО 4 ПРОБЕЛА СЛЕВА для выравнивания всей цепочки elif
     elif action.startswith("pair:"):
-    pair = action[5:]
-    if pair not in PAIRS:
-        return
-    row = [
-        InlineKeyboardButton(f"{name} · экспирация {exp}", callback_data=f"sig:{pair}:{code}")
-        for code, (name, exp, _) in TIMEFRAMES.items()
-    ]
-    kb = [[b] for b in row] + [[InlineKeyboardButton("⬅️ К выбору пары", callback_data="pairs")]]
-    await safe_edit(
-        q,
-        f"<b>📊 {pair}</b>\n"
-        f"{LINE}\n"
-        "Шаг 2 из 2 — выберите таймфрейм.\n\n"
-        "<i>Таймфрейм - Время, на которое вы входите в сделку.</i>",
-        InlineKeyboardMarkup(kb),
-    )
+        pair = action[5:]
+        if pair not in PAIRS:
+            return
+        row = [
+            InlineKeyboardButton(f"{name} · экспирация {exp}", callback_data=f"sig:{pair}:{code}")
+            for code, (name, exp, _) in TIMEFRAMES.items()
+        ]
+        kb = [[b] for b in row] + [[InlineKeyboardButton("⬅️ К выбору пары", callback_data="pairs")]]
+        await safe_edit(
+            q,
+            f"<b>📊 {pair}</b>\n"
+            f"{LINE}\n"
+            "Шаг 2 из 2 — выберите таймфрейм.\n\n"
+            "<i>Таймфрейм - Время, на которое вы входите в сделку.</i>",
+            InlineKeyboardMarkup(kb),
+        )
 
     elif action.startswith("sig:"):
         try:
@@ -502,7 +477,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Для работы без ограничений подключите VIP-доступ.",
                 InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("💬 Связаться с автором", url=f"https://t.me/https://t.me/Terret911")],
+                        [InlineKeyboardButton("💬 Связаться с автором", url=f"https://t.me/{CONTACT_USERNAME}")],
                         back_row(),
                     ]
                 ),
@@ -549,19 +524,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
 
         decimals = 3 if "JPY" in pair else 5
-        marks = {1: "▲", -1: "▼", 0: "●"}
+        marks = {1: "▲", -1: "▼"}
         votes_txt = "\n".join(
             f"{marks[v]} <b>{escape(name)}</b>\n    {escape(txt)}" for name, txt, v in res["votes"]
         )
 
+        strength = {5: "идеальный", 3: "стандартный", 1: "слабый"}[abs(res["score"])]
         if res["direction"] == "UP":
-            strength = {2: "слабый", 3: "умеренный"}.get(abs(res["score"]), "сильный")
-            head = f"🟢 <b>ВВЕРХ (CALL)</b> · {strength} перевес"
+            head = f"🟢 <b>ВВЕРХ (CALL)</b> · {strength} сигнал"
         elif res["direction"] == "DOWN":
-            strength = {2: "слабый", 3: "умеренный"}.get(abs(res["score"]), "сильный")
-            head = f"🔴 <b>ВНИЗ (PUT)</b> · {strength} перевес"
+            head = f"🔴 <b>ВНИЗ (PUT)</b> · {strength} сигнал"
         else:
-            head = "⚪ <b>ЧЁТКОГО СИГНАЛА НЕТ</b>\nИндикаторы расходятся: выраженного перевеса нет."
+            head = f"⚪ <b>СИГНАЛА НЕТ</b>\nПричина: {res['reason']}.\nЛучше пропустить вход."
 
         now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M МСК")
         if tier == "vip":
@@ -575,7 +549,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{LINE}\n"
             f"<b>РЕЗУЛЬТАТ</b>\n{head}\n\n"
             f"Баланс голосов: <b>{res['score']:+d}</b>  "
-            f"(▲ {res['up']} · ▼ {res['down']} · ● {res['flat']})\n"
+            f"(▲ {res['up']} · ▼ {res['down']})\n"
             f"{LINE}\n"
             f"<b>ИНДИКАТОРЫ</b>\n{votes_txt}\n"
             f"{LINE}\n"
@@ -584,8 +558,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Волатильность (ATR): {res['volatility']}\n"
             f"Ориентир по экспирации: {expiry}\n"
             f"{LINE}\n"
-            f"{remaining}\n\n"
-            f"{SHORT_DISCLAIMER}"
+            f"{remaining}"
         )
         kb = InlineKeyboardMarkup(
             [
