@@ -20,27 +20,41 @@ from telegram.ext import (
     ContextTypes,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 log = logging.getLogger("bot")
 
 # ======================= НАСТРОЙКИ =======================
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 FREE_CHANNEL_ID = int(os.environ["FREE_CHANNEL_ID"])
 VIP_CHANNEL_ID = int(os.environ["VIP_CHANNEL_ID"])
-FREE_CHANNEL_URL = os.getenv("FREE_CHANNEL_URL", "https://t.me/+F_OldsGjeK5lMjBi")
-VIP_CHANNEL_URL = os.getenv("VIP_CHANNEL_URL", "https://t.me/+itYuwMLRnBcyNDEy")
+
+FREE_CHANNEL_URL = os.getenv(
+    "FREE_CHANNEL_URL",
+    "https://t.me/+F_OldsGjeK5lMjBi",
+)
+VIP_CHANNEL_URL = os.getenv(
+    "VIP_CHANNEL_URL",
+    "https://t.me/+itYuwMLRnBcyNDEy",
+)
+
 REF_LINK = os.environ["REF_LINK"]
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
 CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "Terret911")
+
 DAILY_LIMIT = 10
 TZ = ZoneInfo("Europe/Moscow")
 DATA_FILE = "data.json"
-CACHE_TTL = 45  # секунд
+CACHE_TTL = 45
 
-with open("pairs.json", encoding="utf-8") as f:
-    PAIRS = json.load(f)  # Например: {"EUR/USD": "EURUSD=X"}
+with open("pairs.json", encoding="utf-8") as file:
+    PAIRS = json.load(file)
 
-# код -> (название, ориентир по экспирации, максимальный возраст последней свечи в минутах)
+# Код -> (название, ориентир по экспирации, максимальный возраст свечи в минутах).
+# Порог используется для статуса котировки, но не блокирует анализ.
 TIMEFRAMES = {
     "1m": ("M1", "1–3 мин", 10),
     "5m": ("M5", "5–10 мин", 25),
@@ -51,10 +65,11 @@ LINE = "━━━━━━━━━━━━━━━━━━"
 
 
 # ======================= ХРАНИЛИЩЕ =======================
+
 def load_data() -> dict:
     try:
-        with open(DATA_FILE, encoding="utf-8") as f:
-            data = json.load(f)
+        with open(DATA_FILE, encoding="utf-8") as file:
+            data = json.load(file)
     except (FileNotFoundError, json.JSONDecodeError):
         data = {}
 
@@ -65,8 +80,8 @@ def load_data() -> dict:
 
 
 def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+    with open(DATA_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False)
 
 
 def today() -> str:
@@ -74,19 +89,23 @@ def today() -> str:
 
 
 def used_today(data: dict, user_id: int) -> int:
-    rec = data["usage"].get(str(user_id))
-    return rec["count"] if rec and rec["date"] == today() else 0
+    record = data["usage"].get(str(user_id))
+    if record and record.get("date") == today():
+        return int(record.get("count", 0))
+    return 0
 
 
 # ======================= ПОДПИСКА =======================
+
 async def is_member(bot, chat_id: int, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         return member.status in ("member", "administrator", "creator") or (
-            member.status == "restricted" and getattr(member, "is_member", False)
+            member.status == "restricted"
+            and getattr(member, "is_member", False)
         )
-    except Exception as e:
-        log.warning("get_chat_member failed for %s: %s", chat_id, e)
+    except Exception as error:
+        log.warning("get_chat_member failed for %s: %s", chat_id, error)
         return False
 
 
@@ -100,9 +119,12 @@ async def user_tier(bot, user_id: int) -> str:
 
 
 # ======================= АНАЛИЗ =======================
+
 def analyze_df(df: pd.DataFrame) -> dict:
-    """Рассчитывает пять индикаторов; каждый даёт голос вверх, вниз или нейтрально."""
-    close, high, low = df["Close"], df["High"], df["Low"]
+    """Рассчитывает пять индикаторов и их голоса: вверх, вниз или нейтрально."""
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
 
     ema9 = close.ewm(span=9, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
@@ -113,32 +135,49 @@ def analyze_df(df: pd.DataFrame) -> dict:
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
 
-    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-    hist = macd - macd.ewm(span=9, adjust=False).mean()
+    macd = (
+        close.ewm(span=12, adjust=False).mean()
+        - close.ewm(span=26, adjust=False).mean()
+    )
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    histogram = macd - macd_signal
 
-    mid = close.rolling(20).mean()
+    middle = close.rolling(20).mean()
     std = close.rolling(20).std()
-    upper, lower = mid + 2 * std, mid - 2 * std
+    upper = middle + 2 * std
+    lower = middle - 2 * std
 
-    ll, hh = low.rolling(14).min(), high.rolling(14).max()
-    stoch = (100 * (close - ll) / (hh - ll).replace(0, np.nan)).rolling(3).mean()
+    lowest_low = low.rolling(14).min()
+    highest_high = high.rolling(14).max()
+    stoch_range = (highest_high - lowest_low).replace(0, np.nan)
+    stochastic = (
+        100 * (close - lowest_low) / stoch_range
+    ).rolling(3).mean()
 
-    prev_close = close.shift()
-    tr = pd.concat(
+    previous_close = close.shift()
+    true_range = pd.concat(
         [
             high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
-    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+
+    atr = true_range.ewm(alpha=1 / 14, adjust=False).mean()
     atr_average = atr.rolling(50).mean().iloc[-1]
-    atr_ratio = float(atr.iloc[-1] / atr_average) if pd.notna(atr_average) and atr_average != 0 else 1.0
+
+    if pd.notna(atr_average) and atr_average != 0:
+        atr_ratio = float(atr.iloc[-1] / atr_average)
+    else:
+        atr_ratio = 1.0
 
     votes = []
 
-    e9, e21, e50 = float(ema9.iloc[-1]), float(ema21.iloc[-1]), float(ema50.iloc[-1])
+    e9 = float(ema9.iloc[-1])
+    e21 = float(ema21.iloc[-1])
+    e50 = float(ema50.iloc[-1])
+
     if e9 > e21 > e50:
         votes.append(("Тренд · EMA 9/21/50", "восходящая структура", 1))
     elif e9 < e21 < e50:
@@ -146,42 +185,83 @@ def analyze_df(df: pd.DataFrame) -> dict:
     else:
         votes.append(("Тренд · EMA 9/21/50", "смешанная структура", 0))
 
-    r = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
-    if r < 35:
-        votes.append(("Импульс · RSI(14)", f"{r:.1f} — зона перепроданности", 1))
-    elif r > 65:
-        votes.append(("Импульс · RSI(14)", f"{r:.1f} — зона перекупленности", -1))
-    else:
-        votes.append(("Импульс · RSI(14)", f"{r:.1f} — нейтральная зона", 0))
+    rsi_value = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
 
-    h_now = float(hist.iloc[-1]) if pd.notna(hist.iloc[-1]) else 0.0
-    h_prev = float(hist.iloc[-2]) if pd.notna(hist.iloc[-2]) else 0.0
-    if h_now > 0 and h_now > h_prev:
-        votes.append(("Моментум · MACD", "гистограмма > 0 и растёт", 1))
-    elif h_now < 0 and h_now < h_prev:
-        votes.append(("Моментум · MACD", "гистограмма < 0 и падает", -1))
+    if rsi_value < 35:
+        votes.append(
+            ("Импульс · RSI(14)", f"{rsi_value:.1f} — зона перепроданности", 1)
+        )
+    elif rsi_value > 65:
+        votes.append(
+            ("Импульс · RSI(14)", f"{rsi_value:.1f} — зона перекупленности", -1)
+        )
     else:
-        votes.append(("Моментум · MACD", "нет подтверждённого направления", 0))
+        votes.append(
+            ("Импульс · RSI(14)", f"{rsi_value:.1f} — нейтральная зона", 0)
+        )
+
+    hist_now = (
+        float(histogram.iloc[-1])
+        if pd.notna(histogram.iloc[-1])
+        else 0.0
+    )
+    hist_previous = (
+        float(histogram.iloc[-2])
+        if pd.notna(histogram.iloc[-2])
+        else 0.0
+    )
+
+    if hist_now > 0 and hist_now > hist_previous:
+        votes.append(
+            ("Моментум · MACD", "гистограмма выше нуля и растёт", 1)
+        )
+    elif hist_now < 0 and hist_now < hist_previous:
+        votes.append(
+            ("Моментум · MACD", "гистограмма ниже нуля и снижается", -1)
+        )
+    else:
+        votes.append(
+            ("Моментум · MACD", "нет подтверждённого направления", 0)
+        )
 
     price = float(close.iloc[-1])
     lower_value = float(lower.iloc[-1]) if pd.notna(lower.iloc[-1]) else price
     upper_value = float(upper.iloc[-1]) if pd.notna(upper.iloc[-1]) else price
-    if price < lower_value:
-        votes.append(("Волатильность · Bollinger", "цена ниже нижней границы", 1))
-    elif price > upper_value:
-        votes.append(("Волатильность · Bollinger", "цена выше верхней границы", -1))
-    else:
-        votes.append(("Волатильность · Bollinger", "цена внутри канала", 0))
 
-    s = float(stoch.iloc[-1]) if pd.notna(stoch.iloc[-1]) else 50.0
-    if s < 20:
-        votes.append(("Осциллятор · Stochastic", f"{s:.1f} — перепроданность", 1))
-    elif s > 80:
-        votes.append(("Осциллятор · Stochastic", f"{s:.1f} — перекупленность", -1))
+    if price < lower_value:
+        votes.append(
+            ("Волатильность · Bollinger", "цена ниже нижней границы", 1)
+        )
+    elif price > upper_value:
+        votes.append(
+            ("Волатильность · Bollinger", "цена выше верхней границы", -1)
+        )
     else:
-        votes.append(("Осциллятор · Stochastic", f"{s:.1f} — нейтральная зона", 0))
+        votes.append(
+            ("Волатильность · Bollinger", "цена внутри канала", 0)
+        )
+
+    stoch_value = (
+        float(stochastic.iloc[-1])
+        if pd.notna(stochastic.iloc[-1])
+        else 50.0
+    )
+
+    if stoch_value < 20:
+        votes.append(
+            ("Осциллятор · Stochastic", f"{stoch_value:.1f} — перепроданность", 1)
+        )
+    elif stoch_value > 80:
+        votes.append(
+            ("Осциллятор · Stochastic", f"{stoch_value:.1f} — перекупленность", -1)
+        )
+    else:
+        votes.append(
+            ("Осциллятор · Stochastic", f"{stoch_value:.1f} — нейтральная зона", 0)
+        )
 
     score = sum(vote for _, _, vote in votes)
+
     if score >= 2:
         direction = "UP"
     elif score <= -2:
@@ -212,8 +292,9 @@ _cache: dict = {}
 
 
 def fetch_and_analyze(ticker: str, interval: str) -> dict | None:
-    key = (ticker, interval)
-    cached = _cache.get(key)
+    cache_key = (ticker, interval)
+    cached = _cache.get(cache_key)
+
     if cached and time.time() - cached[0] < CACHE_TTL:
         return cached[1]
 
@@ -224,81 +305,116 @@ def fetch_and_analyze(ticker: str, interval: str) -> dict | None:
         progress=False,
         auto_adjust=True,
     )
+
     if df is None or df.empty:
         return None
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
+    required_columns = {"Close", "High", "Low"}
+    if not required_columns.issubset(df.columns):
+        return None
+
     df = df.dropna(subset=["Close", "High", "Low"])
     if len(df) < 60:
         return None
 
-    last = df.index[-1]
-    last = last.tz_localize("UTC") if last.tzinfo is None else last.tz_convert("UTC")
-    age_min = (pd.Timestamp.now(tz="UTC") - last).total_seconds() / 60
+    last_timestamp = df.index[-1]
+    if last_timestamp.tzinfo is None:
+        last_timestamp = last_timestamp.tz_localize("UTC")
+    else:
+        last_timestamp = last_timestamp.tz_convert("UTC")
+
+    age_min = (
+        pd.Timestamp.now(tz="UTC") - last_timestamp
+    ).total_seconds() / 60
 
     result = analyze_df(df)
-    result["age_min"] = age_min
+    result["age_min"] = max(0.0, age_min)
     result["stale"] = age_min > TIMEFRAMES[interval][2]
-    _cache[key] = (time.time(), result)
+    result["last_candle"] = last_timestamp
+
+    _cache[cache_key] = (time.time(), result)
     return result
 
 
 # ======================= ТЕКСТЫ =======================
+
 WELCOME = (
-    "<b>📈 PO Signals — аналитический терминал</b>\n"
+    "<b>📈 PO SIGNALS</b>\n"
+    "<i>Технический терминал для валютных пар</i>\n"
     f"{LINE}\n"
-    "Технический анализ валютных пар для работы на Pocket Option. "
-    "Бот получает рыночные котировки, рассчитывает пять индикаторов "
-    "и показывает их направления и общий баланс по выбранному таймфрейму.\n\n"
-    "<b>Тарифы доступа</b>\n"
-    "▫️ Базовый — <b>10 анализов в сутки</b>\n"
-    "▫️ VIP — <b>без ограничений</b>\n"
+    "Анализ рыночных котировок по пяти индикаторам "
+    "и трём таймфреймам.\n\n"
+    "<b>Возможности</b>\n"
+    "🔎 Разбор выбранной валютной пары\n"
+    "📊 EMA · RSI · MACD · Bollinger · Stochastic\n"
+    "⏱ Таймфреймы M1 · M5 · M15\n"
+    "🧭 Баланс направлений и состояние рынка\n\n"
+    "<b>Доступ</b>\n"
+    "▫️ Базовый — 10 анализов в сутки\n"
+    "▫️ VIP — без дневного лимита\n"
     f"{LINE}\n"
-    "Выберите раздел:"
+    "Выберите действие:"
 )
 
 METHOD = (
-    "<b>📚 Методика анализа для Pocket Option</b>\n"
+    "<b>🧠 МЕТОДИКА АНАЛИЗА</b>\n"
     f"{LINE}\n"
-    "<b>1. Рыночные данные.</b> Бот загружает котировки валютных пар и формирует "
-    "анализ для выбранного таймфрейма M1, M5 или M15. Котировки поступают из "
-    "Yahoo Finance; они могут отличаться от котировок Pocket Option. "
-    "Сопоставляйте время свечей и цену на платформе перед использованием сигнала.\n\n"
-    "<b>2. Индикаторы.</b> Рассчитываются пять технических показателей:\n"
-    "▫️ EMA 9/21/50 — структура тренда\n"
-    "▫️ RSI(14) — зоны перекупленности и перепроданности\n"
-    "▫️ MACD (12/26/9) — направление и изменение моментума\n"
-    "▫️ Bollinger Bands (20, 2σ) — положение цены относительно канала\n"
-    "▫️ Stochastic (14, 3) — положение цены в диапазоне\n\n"
-    "<b>3. Как читать соотношение голосов.</b> Каждый индикатор формирует один голос: "
-    "вверх, вниз или нейтрально. Бот показывает распределение этих голосов — "
-    "например, 2 из 5 за рост и 2 из 5 за снижение, а оставшийся голос нейтральный. "
-    "Это соотношение мнений индикаторов, а не процент вероятности и не заданное "
-    "заранее распределение сигналов.\n\n"
-    "<b>4. Итоговое направление.</b> Баланс рассчитывается как число голосов вверх "
-    "минус число голосов вниз. При балансе от +2 бот показывает направление вверх, "
-    "при балансе от −2 — вниз. При меньшем перевесе указывается, что индикаторы "
-    "не сформировали единого направления.\n\n"
-    "<b>5. Применение на Pocket Option.</b> Выберите пару и таймфрейм, затем "
-    "сравните результат с текущим графиком платформы. Экспирация в сообщении "
-    "служит ориентиром, соответствующим выбранному таймфрейму.\n"
+    "<b>01 · Рыночные данные</b>\n"
+    "Котировки загружаются из Yahoo Finance. В выходные и праздничные дни "
+    "некоторые инструменты могут не обновляться. В этом случае анализ "
+    "строится по последним доступным свечам, а их возраст отображается "
+    "в результате. Котировки могут отличаться от Pocket Option.\n\n"
+    "<b>02 · Пять индикаторов</b>\n"
+    "📈 EMA 9/21/50 — структура тренда\n"
+    "⚡ RSI(14) — импульс и зоны экстремума\n"
+    "〽️ MACD (12/26/9) — динамика момента\n"
+    "🎚 Bollinger Bands (20, 2σ) — положение в канале\n"
+    "🔄 Stochastic (14, 3) — положение цены в диапазоне\n\n"
+    "<b>03 · Баланс голосов</b>\n"
+    "Каждый индикатор даёт голос вверх, вниз или нейтрально. Бот суммирует "
+    "голоса и отображает распределение. Это техническая оценка данных, "
+    "а не рассчитанная статистическая проходимость.\n\n"
+    "<b>04 · Итоговое направление</b>\n"
+    "При балансе от +2 отображается направление вверх, при балансе от −2 — "
+    "вниз. При меньшем перевесе результат отмечается как нейтральный.\n\n"
+    "<b>05 · Работа с Pocket Option</b>\n"
+    "Выберите пару и таймфрейм, затем сопоставьте результат с графиком "
+    "платформы. Экспирация указана как ориентир. Перед использованием "
+    "результата проверьте время последней свечи и цену.\n"
     f"{LINE}"
+)
+
+LOCKED = (
+    "<b>🔒 Доступ к терминалу</b>\n"
+    f"{LINE}\n"
+    "Для использования бота требуется подписка на канал.\n\n"
+    "1️⃣ Подпишитесь на один из каналов.\n"
+    "2️⃣ Нажмите «Проверить подписку».\n\n"
+    "▫️ Основной канал — 10 анализов в сутки\n"
+    "▫️ VIP-канал — без дневного лимита"
 )
 
 
 # ======================= КЛАВИАТУРЫ =======================
+
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📊 Новый анализ", callback_data="pairs")],
             [
-                InlineKeyboardButton("📚 Методика", callback_data="method"),
+                InlineKeyboardButton("🧠 Методика", callback_data="method"),
                 InlineKeyboardButton("👤 Профиль", callback_data="status"),
             ],
-            [InlineKeyboardButton("🔗 Регистрация", callback_data="ref")],
-            [InlineKeyboardButton("💬 Поддержка", url=f"https://t.me/{CONTACT_USERNAME}")],
+            [InlineKeyboardButton("🔗 Подключить доступ", callback_data="ref")],
+            [
+                InlineKeyboardButton(
+                    "💬 Поддержка",
+                    url=f"https://t.me/{CONTACT_USERNAME}",
+                )
+            ],
         ]
     )
 
@@ -317,33 +433,28 @@ def subscribe_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-LOCKED = (
-    "<b>🔒 Доступ ограничен</b>\n"
-    f"{LINE}\n"
-    "Для работы с терминалом необходима подписка на канал автора.\n\n"
-    "1. Подпишитесь на канал.\n"
-    "2. Нажмите «Проверить подписку».\n\n"
-    "▫️ Основной канал — 10 анализов в сутки\n"
-    "▫️ VIP-канал — без ограничений"
-)
-
-
-async def safe_edit(q, text: str, kb: InlineKeyboardMarkup | None = None):
+async def safe_edit(
+    query,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
     try:
-        await q.edit_message_text(
+        await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb,
+            reply_markup=keyboard,
             disable_web_page_preview=True,
         )
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
+    except BadRequest as error:
+        if "not modified" not in str(error).lower():
             raise
 
 
 # ======================= КОМАНДЫ =======================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tier = await user_tier(context.bot, update.effective_user.id)
+
     if tier == "none":
         await update.message.reply_text(
             LOCKED,
@@ -360,41 +471,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь отправляет свой ID Pocket Option, администратор подтверждает его вручную."""
     if not context.args:
         await update.message.reply_text(
-            "<b>Подтверждение регистрации</b>\n\n"
-            "Отправьте команду в формате:\n<code>/uid 12345678</code>\n\n"
-            "где <code>12345678</code> — ваш ID в профиле Pocket Option.",
+            "<b>Подключение доступа</b>\n\n"
+            "Отправьте команду:\n"
+            "<code>/uid 12345678</code>\n\n"
+            "Вместо числа укажите ID из профиля Pocket Option.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     user = update.effective_user
-    uid = context.args[0][:32]
+    pocket_id = context.args[0][:32]
+
     data = load_data()
-    data["uids"][str(user.id)] = uid
+    data["uids"][str(user.id)] = pocket_id
     save_data(data)
 
     await update.message.reply_text(
         "✅ <b>ID получен.</b>\n"
-        "Заявка отправлена на проверку, статус появится в разделе «Профиль».",
+        "Заявка отправлена на проверку.",
         parse_mode=ParseMode.HTML,
     )
 
     if ADMIN_ID:
         try:
+            username = escape(user.username or str(user.id))
+            safe_pocket_id = escape(pocket_id)
+
             await context.bot.send_message(
                 ADMIN_ID,
-                f"🆕 <b>Заявка на подтверждение</b>\n"
-                f"Пользователь: @{escape(user.username or str(user.id))} "
-                f"(<code>{user.id}</code>)\n"
-                f"ID Pocket Option: <code>{escape(uid)}</code>\n\n"
+                "🆕 <b>Заявка на подтверждение</b>\n"
+                f"Пользователь: @{username} (<code>{user.id}</code>)\n"
+                f"ID Pocket Option: <code>{safe_pocket_id}</code>\n\n"
                 f"Подтвердить: <code>/approve {user.id}</code>",
                 parse_mode=ParseMode.HTML,
             )
-        except Exception as e:
-            log.warning("Не удалось отправить заявку админу: %s", e)
+        except Exception as error:
+            log.warning("Не удалось отправить заявку админу: %s", error)
 
 
 async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,6 +521,7 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = load_data()
+
     if user_id not in data["approved"]:
         data["approved"].append(user_id)
         save_data(data)
@@ -416,14 +531,15 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             user_id,
-            "✅ <b>Регистрация подтверждена.</b> Спасибо!",
+            "✅ <b>Регистрация подтверждена.</b>",
             parse_mode=ParseMode.HTML,
         )
-    except Exception as e:
-        log.warning("Не удалось уведомить пользователя: %s", e)
+    except Exception as error:
+        log.warning("Не удалось уведомить пользователя: %s", error)
 
 
 # ======================= КНОПКИ =======================
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -440,22 +556,30 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "menu":
         await safe_edit(query, WELCOME, main_menu())
+        return
 
-    elif action == "method":
-        await safe_edit(query, METHOD, InlineKeyboardMarkup([back_row()]))
-
-    elif action == "ref":
-        text = (
-            "<b>🔗 Регистрация на Pocket Option</b>\n"
-            f"{LINE}\n"
-            "Это партнёрская ссылка автора бота: при регистрации по ней автор может "
-            "получать вознаграждение от брокера. Для пользователя условия не меняются.\n\n"
-            "<b>Порядок действий</b>\n"
-            "1. Откройте ссылку и создайте аккаунт.\n"
-            "2. Скопируйте свой ID из профиля Pocket Option.\n"
-            "3. Отправьте боту: <code>/uid 12345678</code>\n"
-            "4. Дождитесь подтверждения — статус появится в разделе «Профиль»."
+    if action == "method":
+        await safe_edit(
+            query,
+            METHOD,
+            InlineKeyboardMarkup([back_row()]),
         )
+        return
+
+    if action == "ref":
+        text = (
+            "<b>🔗 ПОДКЛЮЧЕНИЕ ДОСТУПА</b>\n"
+            f"{LINE}\n"
+            "Регистрация по ссылке — условие предоставления бесплатного "
+            "доступа к терминалу.\n\n"
+            "<b>Порядок подключения</b>\n"
+            "1️⃣ Откройте ссылку и зарегистрируйтесь.\n"
+            "2️⃣ Скопируйте ID из профиля Pocket Option.\n"
+            "3️⃣ Отправьте боту: <code>/uid 12345678</code>\n"
+            "4️⃣ Дождитесь подтверждения.\n"
+            f"{LINE}"
+        )
+
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("🚀 Открыть Pocket Option", url=REF_LINK)],
@@ -463,25 +587,34 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
         await safe_edit(query, text, keyboard)
+        return
 
-    elif action == "status":
+    if action == "status":
         if tier == "vip":
             plan = "💎 VIP"
-            limit = "без ограничений"
+            limit = "без дневного лимита"
         else:
             plan = "🆓 Базовый"
-            limit = f"{used_today(data, user.id)} из {DAILY_LIMIT} использовано сегодня"
+            limit = (
+                f"{used_today(data, user.id)} из {DAILY_LIMIT} "
+                "анализов использовано сегодня"
+            )
 
-        registration = "✅ подтверждена" if user.id in data["approved"] else "⏳ не подтверждена"
+        registration = (
+            "✅ подтверждена"
+            if user.id in data["approved"]
+            else "⏳ ожидает подтверждения"
+        )
+
         text = (
-            "<b>👤 Профиль</b>\n"
+            "<b>👤 ПРОФИЛЬ</b>\n"
             f"{LINE}\n"
-            f"ID Telegram: <code>{user.id}</code>\n"
+            f"Telegram ID: <code>{user.id}</code>\n"
             f"Тариф: <b>{plan}</b>\n"
             f"Анализы: {limit}\n"
             f"Регистрация: {registration}\n"
             f"{LINE}\n"
-            "Счётчик обновляется ежедневно в 00:00 МСК."
+            "Лимит обновляется ежедневно в 00:00 МСК."
         )
 
         keyboard_rows = [back_row()]
@@ -492,24 +625,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         await safe_edit(query, text, InlineKeyboardMarkup(keyboard_rows))
+        return
 
-    elif action == "pairs":
+    if action == "pairs":
         names = list(PAIRS.keys())
         rows = [
-            [InlineKeyboardButton(name, callback_data=f"pair:{name}") for name in names[i : i + 2]]
-            for i in range(0, len(names), 2)
+            [
+                InlineKeyboardButton(name, callback_data=f"pair:{name}")
+                for name in names[index : index + 2]
+            ]
+            for index in range(0, len(names), 2)
         ]
         rows.append(back_row())
 
         await safe_edit(
             query,
-            "<b>📊 Новый анализ</b>\n"
+            "<b>📊 НОВЫЙ АНАЛИЗ</b>\n"
             f"{LINE}\n"
             "Шаг 1 из 2 — выберите валютную пару:",
             InlineKeyboardMarkup(rows),
         )
+        return
 
-    elif action.startswith("pair:"):
+    if action.startswith("pair:"):
         pair = action[5:]
         if pair not in PAIRS:
             return
@@ -517,10 +655,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = [
             InlineKeyboardButton(
                 f"{name} · экспирация {expiry}",
-                callback_data=f"sig:{pair}:{code}",
+                callback_data=f"sig:{pair}:{timeframe}",
             )
-            for code, (name, expiry, _) in TIMEFRAMES.items()
+            for timeframe, (name, expiry, _) in TIMEFRAMES.items()
         ]
+
         keyboard = [[button] for button in buttons]
         keyboard.append(
             [InlineKeyboardButton("⬅️ К выбору пары", callback_data="pairs")]
@@ -528,188 +667,201 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await safe_edit(
             query,
-            f"<b>📊 {pair}</b>\n"
+            f"<b>📊 {escape(pair)}</b>\n"
             f"{LINE}\n"
             "Шаг 2 из 2 — выберите таймфрейм.\n\n"
-            "<i>Чем меньше таймфрейм, тем больше рыночного шума.</i>",
+            "⏱ На малых таймфреймах больше краткосрочных колебаний.",
             InlineKeyboardMarkup(keyboard),
         )
+        return
 
-    elif action.startswith("sig:"):
-        try:
-            _, pair, timeframe = action.split(":")
-        except ValueError:
-            return
+    if not action.startswith("sig:"):
+        return
 
-        if pair not in PAIRS or timeframe not in TIMEFRAMES:
-            return
+    try:
+        _, pair, timeframe = action.split(":")
+    except ValueError:
+        return
 
-        if tier == "free" and used_today(data, user.id) >= DAILY_LIMIT:
-            await safe_edit(
-                query,
-                "<b>⛔ Дневной лимит исчерпан</b>\n"
-                f"{LINE}\n"
-                f"Вы использовали {DAILY_LIMIT} из {DAILY_LIMIT} анализов.\n"
-                "Лимит обновится в 00:00 МСК.\n\n"
-                "Для работы без ограничений подключите VIP-доступ.",
-                InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("💎 VIP-канал", url=VIP_CHANNEL_URL)],
-                        [
-                            InlineKeyboardButton(
-                                "💬 Связаться с автором",
-                                url=f"https://t.me/{CONTACT_USERNAME}",
-                            )
-                        ],
-                        back_row(),
-                    ]
-                ),
-            )
-            return
+    if pair not in PAIRS or timeframe not in TIMEFRAMES:
+        return
 
-        timeframe_name, expiry, _ = TIMEFRAMES[timeframe]
-        await safe_edit(
-            query,
-            f"⏳ <b>{pair} · {timeframe_name}</b>\n"
-            "Загружаю котировки и рассчитываю индикаторы…",
-        )
-
-        try:
-            result = await asyncio.to_thread(
-                fetch_and_analyze,
-                PAIRS[pair],
-                timeframe,
-            )
-        except Exception as e:
-            log.exception("analysis failed: %s", e)
-            result = None
-
-        back_keyboard = InlineKeyboardMarkup(
+    if tier == "free" and used_today(data, user.id) >= DAILY_LIMIT:
+        keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("🔄 Другая пара", callback_data="pairs")],
+                [InlineKeyboardButton("💎 VIP-канал", url=VIP_CHANNEL_URL)],
+                [
+                    InlineKeyboardButton(
+                        "💬 Поддержка",
+                        url=f"https://t.me/{CONTACT_USERNAME}",
+                    )
+                ],
                 back_row(),
             ]
         )
+        await safe_edit(
+            query,
+            "<b>⛔ ДНЕВНОЙ ЛИМИТ ИСЧЕРПАН</b>\n"
+            f"{LINE}\n"
+            f"Использовано {DAILY_LIMIT} из {DAILY_LIMIT} анализов.\n"
+            "Лимит обновится в 00:00 МСК.",
+            keyboard,
+        )
+        return
 
-        if result is None:
-            await safe_edit(
-                query,
-                "<b>😕 Данные недоступны</b>\n\n"
-                "Не удалось получить котировки. Попробуйте позже. "
-                "Анализ не засчитан в лимит.",
-                back_keyboard,
-            )
-            return
+    timeframe_name, expiry, _ = TIMEFRAMES[timeframe]
 
-        if result["stale"]:
-            await safe_edit(
-                query,
-                "<b>🕒 Нет свежих котировок</b>\n"
-                f"{LINE}\n"
-                f"Последняя доступная котировка по {pair} получена "
-                f"{result['age_min'] / 60:.1f} ч назад. "
-                "Анализ по устаревшим данным не выполняется.\n\n"
-                "Для валютного рынка котировки обычно доступны с понедельника "
-                "по пятницу. Анализ не засчитан в лимит.",
-                back_keyboard,
-            )
-            return
+    await safe_edit(
+        query,
+        f"⏳ <b>{escape(pair)} · {timeframe_name}</b>\n"
+        "Загружаю котировки и рассчитываю индикаторы…",
+    )
 
-        record = data["usage"].get(str(user.id))
-        if not record or record["date"] != today():
-            record = {"date": today(), "count": 0}
+    try:
+        result = await asyncio.to_thread(
+            fetch_and_analyze,
+            PAIRS[pair],
+            timeframe,
+        )
+    except Exception as error:
+        log.exception("Analysis failed: %s", error)
+        result = None
 
-        record["count"] += 1
-        data["usage"][str(user.id)] = record
-        save_data(data)
+    back_keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Другая пара", callback_data="pairs")],
+            back_row(),
+        ]
+    )
 
-        decimals = 3 if "JPY" in pair else 5
-        marks = {1: "▲", -1: "▼", 0: "●"}
-        votes_text = "\n".join(
-            f"{marks[vote]} <b>{escape(name)}</b>\n    {escape(description)}"
-            for name, description, vote in result["votes"]
+    if result is None:
+        await safe_edit(
+            query,
+            "<b>😕 КОТИРОВКИ НЕДОСТУПНЫ</b>\n\n"
+            "Не удалось получить достаточное количество данных. "
+            "Попробуйте позже. Анализ не засчитан в лимит.",
+            back_keyboard,
+        )
+        return
+
+    record = data["usage"].get(str(user.id))
+    if not record or record.get("date") != today():
+        record = {"date": today(), "count": 0}
+
+    record["count"] += 1
+    data["usage"][str(user.id)] = record
+    save_data(data)
+
+    decimals = 3 if "JPY" in pair else 5
+    marks = {1: "▲", -1: "▼", 0: "●"}
+
+    votes_text = "\n".join(
+        f"{marks[vote]} <b>{escape(name)}</b>\n    {escape(description)}"
+        for name, description, vote in result["votes"]
+    )
+
+    if result["direction"] == "UP":
+        strength = {2: "умеренный", 3: "выраженный"}.get(
+            abs(result["score"]),
+            "сильный",
+        )
+        heading = f"🟢 <b>ВВЕРХ (CALL)</b> · {strength} перевес"
+    elif result["direction"] == "DOWN":
+        strength = {2: "умеренный", 3: "выраженный"}.get(
+            abs(result["score"]),
+            "сильный",
+        )
+        heading = f"🔴 <b>ВНИЗ (PUT)</b> · {strength} перевес"
+    else:
+        heading = (
+            "⚪ <b>НЕЙТРАЛЬНОЕ НАПРАВЛЕНИЕ</b>\n"
+            "Голоса индикаторов не сформировали достаточный перевес."
         )
 
-        if result["direction"] == "UP":
-            strength = {2: "слабый", 3: "умеренный"}.get(
-                abs(result["score"]), "сильный"
-            )
-            heading = f"🟢 <b>ВВЕРХ (CALL)</b> · {strength} перевес"
-        elif result["direction"] == "DOWN":
-            strength = {2: "слабый", 3: "умеренный"}.get(
-                abs(result["score"]), "сильный"
-            )
-            heading = f"🔴 <b>ВНИЗ (PUT)</b> · {strength} перевес"
-        else:
-            heading = (
-                "⚪ <b>ЧЁТКОГО НАПРАВЛЕНИЯ НЕТ</b>\n"
-                "Голоса индикаторов распределились без достаточного перевеса."
-            )
+    if result["stale"]:
+        quote_status = (
+            f"🕰 Последняя свеча: {result['age_min'] / 60:.1f} ч назад "
+            "(используются последние доступные данные)"
+        )
+    else:
+        quote_status = f"🟢 Данные обновлялись около {result['age_min']:.0f} мин назад"
 
-        now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M МСК")
+    now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M МСК")
 
-        if tier == "vip":
-            remaining = "💎 VIP — без ограничений"
-        else:
-            remaining = (
-                f"🆓 Осталось анализов сегодня: "
-                f"{DAILY_LIMIT - record['count']} из {DAILY_LIMIT}"
-            )
-
-        total_votes = len(result["votes"])
-        up_share = result["up"] / total_votes * 100 if total_votes else 0
-        down_share = result["down"] / total_votes * 100 if total_votes else 0
-
-        text = (
-            f"<b>📊 {pair} · {timeframe_name}</b>\n"
-            f"<code>{now}</code>\n"
-            f"{LINE}\n"
-            f"<b>РЕЗУЛЬТАТ</b>\n{heading}\n\n"
-            f"Баланс голосов: <b>{result['score']:+d}</b>  "
-            f"(▲ {result['up']} · ▼ {result['down']} · ● {result['flat']})\n"
-            f"Доля голосов от пяти индикаторов: "
-            f"▲ {up_share:.0f}% · ▼ {down_share:.0f}%\n"
-            f"{LINE}\n"
-            f"<b>ИНДИКАТОРЫ</b>\n{votes_text}\n"
-            f"{LINE}\n"
-            f"<b>РЫНОК</b>\n"
-            f"Цена: <code>{result['price']:.{decimals}f}</code>\n"
-            f"Волатильность (ATR): {result['volatility']}\n"
-            f"Ориентир по экспирации: {expiry}\n"
-            f"{LINE}\n"
-            f"{remaining}"
+    if tier == "vip":
+        remaining = "💎 VIP — без дневного лимита"
+    else:
+        remaining = (
+            f"🆓 Осталось анализов сегодня: "
+            f"{DAILY_LIMIT - record['count']} из {DAILY_LIMIT}"
         )
 
-        keyboard = InlineKeyboardMarkup(
+    total_votes = len(result["votes"])
+    up_share = result["up"] / total_votes * 100 if total_votes else 0
+    down_share = result["down"] / total_votes * 100 if total_votes else 0
+
+    text = (
+        f"<b>📊 {escape(pair)} · {timeframe_name}</b>\n"
+        f"<code>{now}</code>\n"
+        f"{LINE}\n"
+        f"<b>АНАЛИТИЧЕСКИЙ РЕЗУЛЬТАТ</b>\n"
+        f"{heading}\n\n"
+        f"Баланс голосов: <b>{result['score']:+d}</b>\n"
+        f"▲ Вверх: {result['up']} · "
+        f"▼ Вниз: {result['down']} · "
+        f"● Нейтрально: {result['flat']}\n"
+        f"Доли от пяти индикаторов: ▲ {up_share:.0f}% · ▼ {down_share:.0f}%\n"
+        f"{LINE}\n"
+        f"<b>ИНДИКАТОРЫ</b>\n{votes_text}\n"
+        f"{LINE}\n"
+        f"<b>СОСТОЯНИЕ РЫНКА</b>\n"
+        f"Цена: <code>{result['price']:.{decimals}f}</code>\n"
+        f"Волатильность ATR: {result['volatility']}\n"
+        f"Ориентир по экспирации: {expiry}\n"
+        f"{quote_status}\n"
+        f"{LINE}\n"
+        f"{remaining}"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        [
             [
-                [InlineKeyboardButton("🔄 Обновить", callback_data=f"sig:{pair}:{timeframe}")],
-                [
-                    InlineKeyboardButton(
-                        "🕒 Другой таймфрейм",
-                        callback_data=f"pair:{pair}",
-                    ),
-                    InlineKeyboardButton(
-                        "💱 Другая пара",
-                        callback_data="pairs",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton("📚 Методика", callback_data="method"),
-                    InlineKeyboardButton("⬅️ Меню", callback_data="menu"),
-                ],
-            ]
-        )
+                InlineKeyboardButton(
+                    "🔄 Обновить анализ",
+                    callback_data=f"sig:{pair}:{timeframe}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🕒 Другой таймфрейм",
+                    callback_data=f"pair:{pair}",
+                ),
+                InlineKeyboardButton(
+                    "💱 Другая пара",
+                    callback_data="pairs",
+                ),
+            ],
+            [
+                InlineKeyboardButton("🧠 Методика", callback_data="method"),
+                InlineKeyboardButton("⬅️ Меню", callback_data="menu"),
+            ],
+        ]
+    )
 
-        await safe_edit(query, text, keyboard)
+    await safe_edit(query, text, keyboard)
 
+
+# ======================= ЗАПУСК =======================
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler(["start", "help"], start))
-    app.add_handler(CommandHandler("uid", uid_cmd))
-    app.add_handler(CommandHandler("approve", approve_cmd))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.run_polling()
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler(["start", "help"], start))
+    application.add_handler(CommandHandler("uid", uid_cmd))
+    application.add_handler(CommandHandler("approve", approve_cmd))
+    application.add_handler(CallbackQueryHandler(on_button))
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
