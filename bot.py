@@ -1,299 +1,317 @@
-import os
-import json
-import random
-import logging
 import asyncio
+import json
+import logging
+import os
+import random
 from datetime import datetime, timedelta
-import pandas as pd
-import yfinance as yf
+from html import escape
+from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import yfinance as yf
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
-    ContextTypes,
-    ConversationHandler
 )
 
-# Настройка логирования
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Загрузка конфигурации валютных пар (из вашего JSON)
-ASSETS_JSON = """{
-  "EUR/USD": "EURUSD=X",
-  "GBP/USD": "GBPUSD=X",
-  "USD/JPY": "JPY=X",
-  "AUD/USD": "AUDUSD=X",
-  "USD/CAD": "CAD=X",
-  "USD/CHF": "CHF=X",
-  "EUR/JPY": "EURJPY=X",
-  "EUR/GBP": "EURGBP=X"
-}"""
-ASSETS = json.loads(ASSETS_JSON)
+TZ = ZoneInfo("Europe/Moscow")
 
-# Состояния для диалога отправки UID
+ASSETS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "USD/CHF": "CHF=X",
+    "EUR/JPY": "EURJPY=X",
+    "EUR/GBP": "EURGBP=X",
+}
+
 AWAITING_UID = 1
 
-# Загрузка переменных окружения из GitHub Actions
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REF_LINK = os.getenv("REF_LINK", "https://pocketoption.com")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
 
-# Файлы для симуляции простой БД (так как в GitHub Actions контейнер эфемерный, 
-# верификация идет через ручной аппрув админом)
+# ВНИМАНИЕ: в GitHub Actions файловая система эфемерная — после перезапуска список
+# одобренных пропадёт. Для постоянного хранения нужен хостинг с диском или внешняя БД.
 APPROVED_USERS_FILE = "approved_users.json"
 
-def get_approved_users():
+DISCLAIMER = (
+    "<i>⚠️ Упрощённая оценка, реальная вероятность ≈ 50/50. Не инвестиционная "
+    "рекомендация, результат не гарантирован. Бинарные опционы — высокий риск потери средств.</i>"
+)
+
+
+def get_approved_users() -> list:
     if os.path.exists(APPROVED_USERS_FILE):
-        with open(APPROVED_USERS_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(APPROVED_USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return []
     return []
 
-def approve_user_id(user_id):
+
+def approve_user_id(user_id: int) -> None:
     users = get_approved_users()
     if user_id not in users:
         users.append(user_id)
-        with open(APPROVED_USERS_FILE, "w") as f:
+        with open(APPROVED_USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(users, f)
 
-# Анализ рынка для сигналов 50/50 (RSI + Волатильность)
-def generate_market_signal(ticker_symbol):
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-        df = ticker.history(period="1d", interval="5m")
-        if df.empty or len(df) < 15:
-            raise ValueError("Недостаточно данных")
-        
-        # Расчет базового RSI для направления 50/50
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-10)
-        rsi = 100 - (100 / (1 + rs))
-        current_rsi = rsi.iloc[-1]
-        
-        # Направление
-        direction = "🟢 ВВЕРХ (CALL)" if current_rsi > 50 else "🔴 ВНИЗ (PUT)"
-        
-        # Красивый расчет проходимости (Рандом в пределах успешного коридора 74-92%)
-        winrate = round(random.uniform(74.5, 92.3), 1)
-        
-        return direction, winrate
-    except Exception as e:
-        logger.error(f"Ошибка при получении данных yfinance для {ticker_symbol}: {e}")
-        # Запасной вариант (Фолбэк), если Yahoo Finance временно недоступен
-        direction = random.choice(["🟢 ВВЕРХ (CALL)", "🔴 ВНИЗ (PUT)"])
-        winrate = round(random.uniform(71.0, 89.5), 1)
-        return direction, winrate
 
-# Стартовое меню
+def is_allowed(user_id: int) -> bool:
+    return user_id == ADMIN_ID or user_id in get_approved_users()
+
+
+def generate_market_signal(ticker_symbol: str):
+    """Направление по RSI(14) на 5-минутках. Если данных нет — случайный выбор.
+    Возвращает (направление, rsi или None, источник)."""
+    try:
+        df = yf.Ticker(ticker_symbol).history(period="1d", interval="5m")
+        if df.empty or len(df) < 20:
+            raise ValueError("Недостаточно данных")
+        delta = df["Close"].diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rsi = 100 - 100 / (1 + gain / (loss + 1e-10))
+        current = float(rsi.iloc[-1])
+        direction = "🟢 ВВЕРХ (CALL)" if current > 50 else "🔴 ВНИЗ (PUT)"
+        return direction, current, "RSI(14) по рыночным котировкам"
+    except Exception as e:
+        logger.error("Ошибка yfinance для %s: %s", ticker_symbol, e)
+        direction = random.choice(["🟢 ВВЕРХ (CALL)", "🔴 ВНИЗ (PUT)"])
+        return direction, None, "случайный выбор (нет рыночных данных)"
+
+
+# ---------- меню ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (
-        f"👋 **Привет, {user.first_name}!**\n\n"
-        f"🤖 Добро пожаловать в закрытый аналитический бот для **Pocket Option**.\n\n"
-        f"📈 Наш ИИ анализирует графики в реальном времени и выдает сигналы с проходимостью до 92%.\n\n"
-        f"Чтобы получить доступ к сигналам, вам необходимо активировать аккаунт по нашей партнерской ссылке."
+        f"👋 <b>Привет, {escape(user.first_name or '')}!</b>\n\n"
+        "🤖 Бот для <b>Pocket Option</b>: сигналы в режиме «50/50» на основе простого "
+        "технического индикатора.\n\n"
+        "Чтобы получить доступ, активируйте аккаунт по партнёрской ссылке автора "
+        "(он может получать вознаграждение от брокера).\n\n"
+        f"{DISCLAIMER}"
     )
-    
     keyboard = [
         [InlineKeyboardButton("🔗 1. Регистрация аккаунта", url=REF_LINK)],
         [InlineKeyboardButton("🆔 2. Подтвердить свой UID", callback_data="verify_uid")],
-        [InlineKeyboardButton("📊 3. Получить Сигнал", callback_data="get_signal")]
+        [InlineKeyboardButton("📊 3. Получить сигнал", callback_data="get_signal")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-    elif update.callback_query:
-        await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    markup = InlineKeyboardMarkup(keyboard)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
-# Обработка нажатия на кнопку "Подтвердить UID"
+
+async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выход из диалога ввода UID в главное меню."""
+    await start(update, context)
+    return ConversationHandler.END
+
+
+# ---------- верификация ----------
 async def request_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
     text = (
-        "📝 **Инструкция по верификации аккаунта:**\n\n"
-        f"1. Перейдите по ссылке и зарегистрируйтесь: [Регистрация на Pocket Option]({REF_LINK})\n"
-        "2. Скопируйте ваш **UID** из личного кабинета.\n"
-        "3. **Отправьте ваш UID в ответном сообщении этому боту.**\n\n"
-        "⏳ После проверки администратором вам откроется полный доступ к торговым сигналам!"
+        "📝 <b>Верификация аккаунта</b>\n\n"
+        f'1. Зарегистрируйтесь: <a href="{escape(REF_LINK)}">Pocket Option</a>\n'
+        "2. Скопируйте ваш <b>UID</b> из личного кабинета.\n"
+        "3. <b>Отправьте UID ответным сообщением.</b>\n\n"
+        "⏳ После проверки администратором откроется доступ к сигналам."
     )
-    
-    keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
-    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    kb = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
+    await query.message.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
     return AWAITING_UID
 
-# Получение UID от пользователя и пересылка Админу
+
 async def receive_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_uid = update.message.text.strip()
+    user_uid = update.message.text.strip()[:32]
     user = update.effective_user
-    
-    # Сообщение пользователю
+
+    if not user_uid.isdigit():
+        await update.message.reply_text("❗ UID — это только цифры. Отправьте его ещё раз.")
+        return AWAITING_UID
+
     await update.message.reply_text(
-        f"✅ **Ваш UID ({user_uid}) отправлен на проверку!**\n\n"
-        f"Обычно проверка занимает от 5 до 15 минут. Мы пришлем вам уведомление, как только администратор подтвердит ваш аккаунт."
+        f"✅ <b>UID {escape(user_uid)} отправлен на проверку.</b>\n"
+        "Мы пришлём уведомление, как только администратор подтвердит аккаунт.",
+        parse_mode=ParseMode.HTML,
     )
-    
-    # Отправка заявки администратору (с кнопкой быстрого аппрува)
-    if ADMIN_ID != 0:
+
+    if ADMIN_ID:
         admin_text = (
-            f"🔔 **НОВАЯ ЗАЯВКА НА ВЕРИФИКАЦИЮ!**\n\n"
-            f"👤 Пользователь: {user.mention_markdown_v2()}\n"
-            f"🆔 Telegram ID: `{user.id}`\n"
-            f"🔑 Заявленный UID: `{user_uid}`\n"
+            "🔔 <b>Новая заявка на верификацию</b>\n\n"
+            f'👤 Пользователь: <a href="tg://user?id={user.id}">{escape(user.full_name)}</a>\n'
+            f"🆔 Telegram ID: <code>{user.id}</code>\n"
+            f"🔑 UID: <code>{escape(user_uid)}</code>"
         )
-        keyboard = [
+        kb = [
             [
                 InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{user.id}"),
-                InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{user.id}")
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{user.id}"),
             ]
         ]
         await context.bot.send_message(
-            chat_id=ADMIN_ID, 
-            text=admin_text, 
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="MarkdownV2"
+            ADMIN_ID, admin_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
         )
-    
     return ConversationHandler.END
 
-# Обработка решений администратора
+
 async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.from_user.id != ADMIN_ID:  # защита: решать может только админ
+        await query.answer("Нет доступа", show_alert=True)
+        return
     await query.answer()
-    
-    action, target_user_id = query.data.split("_")
-    target_user_id = int(target_user_id)
-    
-    if action == "approve":
-        approve_user_id(target_user_id)
-        await query.message.edit_text(f"{query.message.text}\n\n🟢 **СТАТУС: ОДОБРЕНО**")
-        
-        # Уведомляем пользователя
-        try:
-            keyboard = [[InlineKeyboardButton("📊 Получить Сигнал", callback_data="get_signal")]]
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text="🎉 **Поздравляем! Ваш аккаунт успешно верифицирован.**\n\nТеперь вам доступен полный функционал торговых сигналов!",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-            
-    elif action == "reject":
-        await query.message.edit_text(f"{query.message.text}\n\n🔴 **СТАТУС: ОТКЛОНЕНО**")
-        # Уведомляем пользователя
-        try:
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text="❌ **К сожалению, ваш UID не найден в списках наших рефералов.**\n\nПожалуйста, убедитесь, что зарегистрировали новый аккаунт по нашей ссылке, и отправьте UID повторно."
-            )
-        except Exception:
-            pass
 
-# Выдача сигналов
+    action, target = query.data.split("_", 1)
+    target_id = int(target)
+    base = query.message.text_html or ""
+
+    if action == "approve":
+        approve_user_id(target_id)
+        await query.message.edit_text(f"{base}\n\n🟢 <b>СТАТУС: ОДОБРЕНО</b>", parse_mode=ParseMode.HTML)
+        try:
+            kb = [[InlineKeyboardButton("📊 Получить сигнал", callback_data="get_signal")]]
+            await context.bot.send_message(
+                target_id,
+                "🎉 <b>Аккаунт верифицирован.</b> Сигналы доступны.",
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.warning("Не удалось уведомить %s", target_id)
+    else:
+        await query.message.edit_text(f"{base}\n\n🔴 <b>СТАТУС: ОТКЛОНЕНО</b>", parse_mode=ParseMode.HTML)
+        try:
+            await context.bot.send_message(
+                target_id,
+                "❌ <b>UID не найден среди рефералов автора.</b>\n"
+                "Убедитесь, что аккаунт создан по партнёрской ссылке, и отправьте UID повторно.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.warning("Не удалось уведомить %s", target_id)
+
+
+# ---------- сигналы ----------
 async def get_signal_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    
-    # Проверка, авторизован ли пользователь
-    approved_users = get_approved_users()
-    if user_id not in approved_users and user_id != ADMIN_ID:
+
+    if not is_allowed(query.from_user.id):
         text = (
-            "🔒 **ДОСТУП ОГРАНИЧЕН!**\n\n"
-            "Вы не можете получать сигналы, так как ваш аккаунт еще не прошел верификацию.\n\n"
-            "Пожалуйста, зарегистрируйтесь по ссылке ниже и пришлите свой UID администратору."
+            "🔒 <b>Доступ ограничен</b>\n\n"
+            "Аккаунт ещё не верифицирован. Зарегистрируйтесь по ссылке и отправьте UID."
         )
-        keyboard = [
+        kb = [
             [InlineKeyboardButton("🔗 Регистрация Pocket Option", url=REF_LINK)],
-            [InlineKeyboardButton("🆔 Подтвердить свой UID", callback_data="verify_uid")]
+            [InlineKeyboardButton("🆔 Подтвердить свой UID", callback_data="verify_uid")],
         ]
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
         return
 
-    # Если доступ есть — выводим меню выбора активов
-    text = "📊 **Выберите валютную пару для генерации сигнала:**"
-    keyboard = []
-    
-    # Строим сетку кнопок для валютных пар по 2 в ряд
-    asset_keys = list(ASSETS.keys())
-    for i in range(0, len(asset_keys), 2):
-        row = [InlineKeyboardButton(asset_keys[i], callback_data=f"sig_{ASSETS[asset_keys[i]]}")]
-        if i + 1 < len(asset_keys):
-            row.append(InlineKeyboardButton(asset_keys[i+1], callback_data=f"sig_{ASSETS[asset_keys[i+1]]}"))
-        keyboard.append(row)
-        
+    names = list(ASSETS.keys())
+    keyboard = [
+        [InlineKeyboardButton(n, callback_data=f"sig_{ASSETS[n]}") for n in names[i : i + 2]]
+        for i in range(0, len(names), 2)
+    ]
     keyboard.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="main_menu")])
-    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await query.message.edit_text(
+        "📊 <b>Выберите валютную пару:</b>",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML,
+    )
 
-# Генерация и красивый вывод самого сигнала
+
 async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    ticker_symbol = query.data.replace("sig_", "")
-    # Находим красивое имя пары по тикеру
-    asset_name = next((k for k, v in ASSETS.items() if v == ticker_symbol), ticker_symbol)
-    
-    # Красивая анимация анализа
-    await query.message.edit_text(f"🔄 *ИИ анализирует стакан и объемы для {asset_name}...* \n⌛ Пожалуйста, подождите.", parse_mode="Markdown")
-    await asyncio.sleep(2.5) # Имитация сложного расчета
-    direction, winrate = generate_market_signal(ticker_symbol)
-    
-# Расчет времени экспирации (+3 или +5 минут случайным образом)
-exp_time = (datetime.now() + timedelta(minutes=random.choice([3, 5]))).strftime("%H:%M")
-signal_text = (
-f"🤖 СИГНАЛ СФОРМИРОВАН 🤖\n"
-f"━━━━━━━━━━━━━━━━━━\n"
-f"📊 Актив: {asset_name}\n"
-f" Направление: {direction}\n"
-f"⏳ Время экспирации: {exp_time} (МСК)\n"
-f"🎯 Точность алгоритма: {winrate}%\n"
-f"━━━━━━━━━━━━━━━━━━\n"
-f"⚠️ Внимание: открывайте сделку строго по указанному времени!"
-)
-keyboard = [
-[InlineKeyboardButton(" Перевход / Другой Актив", callback_data="get_signal")],
-[InlineKeyboardButton(" Открыть Pocket Option", url=REF_LINK)]
-]
-await query.message.edit_text(signal_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# Отмена диалога ввода UID
+    if not is_allowed(query.from_user.id):
+        return
+
+    ticker = query.data.replace("sig_", "", 1)
+    asset_name = next((k for k, v in ASSETS.items() if v == ticker), None)
+    if asset_name is None:
+        return
+
+    await query.message.edit_text(
+        f"🔄 <b>Считаю сигнал для {asset_name}…</b>", parse_mode=ParseMode.HTML
+    )
+    direction, rsi, source = await asyncio.to_thread(generate_market_signal, ticker)
+
+    minutes = random.choice([3, 5])
+    exp_time = (datetime.now(TZ) + timedelta(minutes=minutes)).strftime("%H:%M")
+    rsi_line = f"📉 RSI(14): <code>{rsi:.1f}</code>\n" if rsi is not None else ""
+
+    text = (
+        "🤖 <b>СИГНАЛ СФОРМИРОВАН</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Актив: <b>{asset_name}</b>\n"
+        f"📈 Направление: {direction}\n"
+        f"⏳ Экспирация: <b>{minutes} мин</b> (до {exp_time} МСК)\n"
+        f"{rsi_line}"
+        f"🧮 Основа: {source}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"{DISCLAIMER}"
+    )
+    kb = [
+        [InlineKeyboardButton("🔄 Другой актив", callback_data="get_signal")],
+        [InlineKeyboardButton("🚀 Открыть Pocket Option", url=REF_LINK)],
+    ]
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-await update.message.reply_text("Действие отменено.", reply_markup=None)
-return ConversationHandler.END
+    await update.message.reply_text("Действие отменено. Нажмите /start.")
+    return ConversationHandler.END
+
+
 def main():
-if not BOT_TOKEN:
-logger.error("Переменная BOT_TOKEN не установлена! Бот завершает работу.")
-return
-application = Application.builder().token(BOT_TOKEN).build()
-# Сценарий разговора для UID
-conv_handler = ConversationHandler(
-entry_points=[CallbackQueryHandler(request_uid, pattern="^verify_uid$")],
-states={
-AWAITING_UID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_uid)]
-},
-fallbacks=[CommandHandler("cancel", cancel)],
-per_message=False
-)
-# Регистрация хендлеров
-application.add_handler(CommandHandler("start", start))
-application.add_handler(conv_handler)
-application.add_handler(CallbackQueryHandler(start, pattern="^main_menu$"))
-application.add_handler(CallbackQueryHandler(get_signal_menu, pattern="^get_signal$"))
-application.add_handler(CallbackQueryHandler(process_signal, pattern="^sig_"))
-application.add_handler(CallbackQueryHandler(admin_decision, pattern="^(approve|reject)_"))
-# Старт бота
-logger.info("Бот успешно запущен...")
-application.run_polling()
-if name == 'main':
-main()
+    if not BOT_TOKEN:
+        logger.error("Переменная BOT_TOKEN не установлена!")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(request_uid, pattern="^verify_uid$")],
+        states={AWAITING_UID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_uid)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(back_to_menu, pattern="^main_menu$"),
+        ],
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(start, pattern="^main_menu$"))
+    app.add_handler(CallbackQueryHandler(get_signal_menu, pattern="^get_signal$"))
+    app.add_handler(CallbackQueryHandler(process_signal, pattern="^sig_"))
+    app.add_handler(CallbackQueryHandler(admin_decision, pattern="^(approve|reject)_"))
+
+    logger.info("Бот запущен")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
