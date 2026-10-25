@@ -504,18 +504,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if res["stale"]:
-            await safe_edit(
-                q,
-                "<b>🕒 Рынок сейчас закрыт</b>\n"
-                f"{LINE}\n"
-                f"Последняя доступная котировка по {pair} получена {res['age_min'] / 60:.1f} ч назад. "
-                "Анализ по устаревшим данным не выполняется.\n\n"
-                "Форекс торгуется с понедельника по пятницу. Анализ не засчитан в лимит.",
-                back_kb,
-            )
-            return
-
         rec = data["usage"].get(str(user.id))
         if not rec or rec["date"] != today():
             rec = {"date": today(), "count": 0}
