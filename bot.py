@@ -451,36 +451,49 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Счётчик обновляется ежедневно в 00:00 МСК."
     )
     
-    # 2. Добавлено: Метод, который выведет этот профиль на экран пользователю
-    # Используйте safe_edit, если это обработчик инлайн-кнопки (CallbackQuery)
-  await safe_edit(q, text, InlineKeyboardMarkup(kb))
+    # 1. Исправлено: Текст корректно оформлен в тройные кавычки
+    text = (
+        "<b>👤 Профиль</b>\n"
+        f"{LINE}\n"
+        f"ID Telegram: <code>{user.id}</code>\n"
+        f"Тариф: <b>{plan}</b>\n"
+        f"Анализы: {limit}\n"
+        f"Регистрация: {reg}\n"
+        f"{LINE}\n"
+        "Счётчик обновляется ежедневно в 00:00 МСК."
+    )
+    
+    # 2. ДОБАВЛЕНО 2 ПРОБЕЛА (теперь код внутри блока статуса)
+    await safe_edit(q, text, InlineKeyboardMarkup(kb))
 
-    elif action == "pairs":
-        names = list(PAIRS.keys())
-        rows = [
-            [InlineKeyboardButton(n, callback_data=f"pair:{n}") for n in names[i : i + 2]]
-            for i in range(0, len(names), 2)
-        ]
-        rows.append(back_row())
-        await safe_edit(q, "Выберите пару:", InlineKeyboardMarkup(rows))
+# УБРАНО 4 ПРОБЕЛА СЛЕВА для выравнивания всей цепочки elif
+elif action == "pairs":
+    names = list(PAIRS.keys())
+    rows = [
+        [InlineKeyboardButton(n, callback_data=f"pair:{n}") for n in names[i : i + 2]]
+        for i in range(0, len(names), 2)
+    ]
+    rows.append(back_row())
+    await safe_edit(q, "Выберите пару:", InlineKeyboardMarkup(rows))
 
-    elif action.startswith("pair:"):
-        pair = action[5:]
-        if pair not in PAIRS:
-            return
-        row = [
-            InlineKeyboardButton(f"{name} · экспирация {exp}", callback_data=f"sig:{pair}:{code}")
-            for code, (name, exp, _) in TIMEFRAMES.items()
-        ]
-        kb = [[b] for b in row] + [[InlineKeyboardButton("⬅️ К выбору пары", callback_data="pairs")]]
-        await safe_edit(
-            q,
-            f"<b>📊 {pair}</b>\n"
-            f"{LINE}\n"
-            "Шаг 2 из 2 — выберите таймфрейм.\n\n"
-            "<i>Таймфрейм - Время, на которое вы входите в сделку.</i>",
-            InlineKeyboardMarkup(kb),
-        )
+# УБРАНО 4 ПРОБЕЛА СЛЕВА для выравнивания всей цепочки elif
+elif action.startswith("pair:"):
+    pair = action[5:]
+    if pair not in PAIRS:
+        return
+    row = [
+        InlineKeyboardButton(f"{name} · экспирация {exp}", callback_data=f"sig:{pair}:{code}")
+        for code, (name, exp, _) in TIMEFRAMES.items()
+    ]
+    kb = [[b] for b in row] + [[InlineKeyboardButton("⬅️ К выбору пары", callback_data="pairs")]]
+    await safe_edit(
+        q,
+        f"<b>📊 {pair}</b>\n"
+        f"{LINE}\n"
+        "Шаг 2 из 2 — выберите таймфрейм.\n\n"
+        "<i>Таймфрейм - Время, на которое вы входите в сделку.</i>",
+        InlineKeyboardMarkup(kb),
+    )
 
     elif action.startswith("sig:"):
         try:
