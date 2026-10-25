@@ -23,8 +23,8 @@ jobs:
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.8851798706:AAGb7U485AU-3I8mow93q1XdI0IPC0Kdx54}}
-          FREE_CHANNEL_ID: ${{ secrets.https://t.me/+F_OldsGjeK5lMjBi }}
-          VIP_CHANNEL_ID: ${{ secrets.https://t.me/+itYuwMLRnBcyNDEy }}
+          FREE_CHANNEL_ID: ${{ secrets.-1003948095604 }}
+          VIP_CHANNEL_ID: ${{ secrets.-1004311060617 }}
           REF_LINK: ${{ secrets.https://po-ru4.click/register?utm_campaign=863901&utm_source=affiliate&utm_medium=sr&a=NEymwkbvmUzYeA&al=1792924&ac=pocket_option_regestration1&cid=977852&code=SDS139 }}
           ADMIN_ID: ${{ secrets.6239904209 }}
         run: python bot.py
