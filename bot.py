@@ -428,15 +428,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Открыть Pocket Option", url=REF_LINK)], back_row()])
         await safe_edit(q, text, kb)
 
-elif action == "status":
-    if tier == "vip":
-        plan = "💎 Член команды Terret'a"
-        limit = "без ограничений"
-    else:
-        plan = "🆓 Базовый"
-        limit = f"{used_today(data, user.id)} из {DAILY_LIMIT} использовано сегодня"
-        
-    reg = "✅ подтверждена" if user.id in data["approved"] else "⏳ не подтверждена"
+    elif action == "status":
+        if tier == "vip":
+            plan = "💎 Член команды Terret'a"
+            limit = "без ограничений"
+        else:
+            plan = "🆓 Базовый"
+            limit = f"{used_today(data, user.id)} из {DAILY_LIMIT} использовано сегодня"
+
+        reg = "✅ подтверждена" if user.id in data["approved"] else "⏳ не подтверждена"
+        # дальше формируете text и вызываете safe_edit
     
     # 1. Исправлено: Текст корректно оформлен в тройные кавычки
     text = (
