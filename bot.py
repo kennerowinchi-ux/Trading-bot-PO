@@ -63,6 +63,7 @@ def load_data() -> dict:
     data.setdefault("usage", {})
     data.setdefault("uids", {})
     data.setdefault("approved", [])
+    data.setdefault("rejected", [])
     return data
 
 
@@ -156,7 +157,7 @@ def analyze_df(df: pd.DataFrame) -> dict:
     else:
         vol = "нормальная"
 
-    return {"price": price, "feats": feats, "volatility": vol}
+    return {"price": price, "atr": atr_last, "feats": feats, "volatility": vol}
 
 
 def vote_now(base: dict) -> dict:
@@ -167,9 +168,16 @@ def vote_now(base: dict) -> dict:
         votes.append((name, up_txt if v > 0 else down_txt, v))
 
     score = sum(v for _, _, v in votes)  # 5 голосов -> всегда нечётное, ничьей нет
+
+    # Цена и волатильность тоже «живут»: цена гуляет в пределах нескольких ATR, волатильность выбирается случайно
+    price = base["price"] + random.gauss(0, base["atr"] * 0.8)
+    levels = ["низкая", "нормальная", "повышенная"]
+    weights = [4 if lvl == base["volatility"] else 1 for lvl in levels]
+    volatility = random.choices(levels, weights=weights)[0]
+
     return {
-        "price": base["price"],
-        "volatility": base["volatility"],
+        "price": price,
+        "volatility": volatility,
         "votes": votes,
         "score": score,
         "direction": "UP" if score > 0 else "DOWN",
@@ -360,6 +368,8 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = context.args[0][:32]
     data = load_data()
     data["uids"][str(user.id)] = uid
+    if user.id in data["rejected"]:
+        data["rejected"].remove(user.id)
     save_data(data)
     await update.message.reply_text(
         "✅ <b>ID получен.</b>\nЗаявка отправлена на проверку, статус появится в разделе «Профиль».",
@@ -372,29 +382,75 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🆕 <b>Заявка на подтверждение</b>\n"
                 f"Пользователь: @{escape(user.username or str(user.id))} (<code>{user.id}</code>)\n"
                 f"ID Pocket Option: <code>{escape(uid)}</code>\n\n"
-                f"Подтвердить: <code>/approve {user.id}</code>",
+                f"Или командами: <code>/approve {user.id}</code> · <code>/reject {user.id}</code>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton("✅ Одобрить", callback_data=f"adm:ok:{user.id}"),
+                            InlineKeyboardButton("❌ Отклонить", callback_data=f"adm:no:{user.id}"),
+                        ]
+                    ]
+                ),
             )
         except Exception as e:
             log.warning("Не удалось отправить заявку админу: %s", e)
 
 
-async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def decide(bot, uid: int, approved: bool) -> bool:
+    """Фиксирует решение админа и пишет пользователю. Возвращает True, если пользователю удалось написать."""
+    data = load_data()
+    if approved:
+        if uid not in data["approved"]:
+            data["approved"].append(uid)
+        if uid in data["rejected"]:
+            data["rejected"].remove(uid)
+        text = (
+            "✅ <b>Заявка одобрена</b>\n"
+            f"{LINE}\n"
+            "Ваша регистрация подтверждена. Анализ рынка теперь доступен.\n\n"
+            "Нажмите /start, чтобы открыть меню."
+        )
+    else:
+        if uid in data["approved"]:
+            data["approved"].remove(uid)
+        if uid not in data["rejected"]:
+            data["rejected"].append(uid)
+        text = (
+            "❌ <b>Заявка отклонена</b>\n"
+            f"{LINE}\n"
+            "Регистрацию подтвердить не удалось. Проверьте, что вы зарегистрировались по ссылке "
+            "из раздела «Регистрация» и указали верный ID.\n\n"
+            "Отправьте ID заново: <code>/uid 12345678</code>"
+        )
+    save_data(data)
+    try:
+        await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+        return True
+    except Exception as e:
+        log.warning("Не удалось уведомить пользователя %s: %s", uid, e)
+        return False
+
+
+async def _decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, approved: bool):
     if update.effective_user.id != ADMIN_ID or not context.args:
         return
     try:
         uid = int(context.args[0])
     except ValueError:
         return
-    data = load_data()
-    if uid not in data["approved"]:
-        data["approved"].append(uid)
-        save_data(data)
-    await update.message.reply_text(f"✅ Пользователь {uid} подтверждён.")
-    try:
-        await context.bot.send_message(uid, "✅ <b>Регистрация подтверждена.</b> Спасибо!", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        log.warning("Не удалось уведомить пользователя: %s", e)
+    notified = await decide(context.bot, uid, approved)
+    word = "одобрена ✅" if approved else "отклонена ❌"
+    note = "" if notified else "\n⚠️ Пользователю написать не удалось (он не запускал бота)."
+    await update.message.reply_text(f"Заявка пользователя {uid} {word}.{note}")
+
+
+async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _decision_cmd(update, context, True)
+
+
+async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _decision_cmd(update, context, False)
 
 
 # ======================= КНОПКИ =======================
@@ -402,6 +458,26 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     user = q.from_user
+
+    if q.data.startswith("adm:"):
+        if user.id != ADMIN_ID:
+            return
+        try:
+            _, act, uid_s = q.data.split(":")
+            uid = int(uid_s)
+        except ValueError:
+            return
+        notified = await decide(context.bot, uid, act == "ok")
+        verdict = "✅ <b>Одобрено</b>" if act == "ok" else "❌ <b>Отклонено</b>"
+        note = "" if notified else "\n⚠️ Пользователю написать не удалось (он не запускал бота)."
+        try:
+            await q.edit_message_text(
+                f"{q.message.text_html}\n\n{verdict}{note}", parse_mode=ParseMode.HTML
+            )
+        except BadRequest:
+            pass
+        return
+
     tier = await user_tier(context.bot, user.id)
 
     if tier == "none":
@@ -461,7 +537,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             plan = "🆓 Базовый"
             limit = f"{used_today(data, user.id)} из {DAILY_LIMIT} использовано сегодня"
 
-        reg = "✅ подтверждена" if user.id in data["approved"] else "⏳ не подтверждена"
+        if user.id in data["approved"]:
+            reg = "✅ подтверждена"
+        elif user.id in data["rejected"]:
+            reg = "❌ отклонена"
+        elif str(user.id) in data["uids"]:
+            reg = "⏳ на проверке"
+        else:
+            reg = "⏳ не подтверждена"
 
         text = (
             "<b>👤 Профиль</b>\n"
@@ -607,6 +690,7 @@ def main():
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("uid", uid_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
+    app.add_handler(CommandHandler("reject", reject_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.run_polling()
 
