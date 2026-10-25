@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+import math
 import os
+import random
 import time
 from datetime import datetime
 from html import escape
@@ -30,7 +32,8 @@ CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "Terret911")
 DAILY_LIMIT = 10
 TZ = ZoneInfo("Europe/Moscow")
 DATA_FILE = "data.json"
-CACHE_TTL = 45  # секунд
+CACHE_TTL = 45  # секунд (кэш котировок)
+NOISE = 0.6     # «случайность» голосов: чем больше, тем сильнее результат меняется при обновлении
 
 
 with open("pairs.json", encoding="utf-8") as f:
@@ -96,7 +99,7 @@ async def user_tier(bot, user_id: int) -> str:
 
 # ======================= АНАЛИЗ =======================
 def analyze_df(df: pd.DataFrame) -> dict:
-    """Система 50/50: 5 судей, каждый голосует только +1 или -1. Сумма всегда нечётная (±1, ±3, ±5)."""
+    """Считает индикаторы и отдаёт для каждого «силу» x (знак = направление). Голоса выносятся в vote_now()."""
     close, high, low = df["Close"], df["High"], df["Low"]
 
     ema9 = close.ewm(span=9, adjust=False).mean()
@@ -111,6 +114,7 @@ def analyze_df(df: pd.DataFrame) -> dict:
     hist = macd - macd.ewm(span=9, adjust=False).mean()
 
     mid = close.rolling(20).mean()
+    std = close.rolling(20).std()
 
     ll, hh = low.rolling(14).min(), high.rolling(14).max()
     stoch = (100 * (close - ll) / (hh - ll).replace(0, np.nan)).rolling(3).mean()
@@ -118,40 +122,28 @@ def analyze_df(df: pd.DataFrame) -> dict:
     prev_close = close.shift()
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    atr_last = float(atr.iloc[-1]) or 1e-9
     atr_ratio = float(atr.iloc[-1] / atr.rolling(50).mean().iloc[-1])
 
     price = float(close.iloc[-1])
-    votes = []
 
-    e9, e21 = float(ema9.iloc[-1]), float(ema21.iloc[-1])
-    votes.append(("Тренд · EMA 9/21", "быстрая выше медленной" if e9 > e21 else "быстрая ниже медленной",
-                  1 if e9 > e21 else -1))
+    def num(x, default=0.0):
+        x = float(x)
+        return default if np.isnan(x) else x
 
-    r = float(rsi.iloc[-1])
-    if np.isnan(r):
-        r = 50.0
-    votes.append(("Импульс · RSI(14)",
-                  f"{r:.1f} — " + ("инициатива у покупателей" if r > 50 else "инициатива у продавцов"),
-                  1 if r > 50 else -1))
+    r = num(rsi.iloc[-1], 50.0)
+    s_ = num(stoch.iloc[-1], 50.0)
+    sd = num(std.iloc[-1], atr_last) or atr_last
 
-    h = float(hist.iloc[-1])
-    votes.append(("Моментум · MACD", "гистограмма выше нуля" if h > 0 else "гистограмма ниже нуля",
-                  1 if h > 0 else -1))
-
-    m = float(mid.iloc[-1])
-    votes.append(("Коридор · Bollinger", "цена выше средней линии" if price > m else "цена ниже средней линии",
-                  1 if price > m else -1))
-
-    s = float(stoch.iloc[-1])
-    if np.isnan(s):
-        s = 50.0
-    votes.append(("Осциллятор · Stochastic", f"{s:.1f} — " + ("сила быков" if s > 50 else "сила медведей"),
-                  1 if s > 50 else -1))
-
-    score = sum(v for _, _, v in votes)
-
-    # Сумма 5 голосов всегда нечётная, поэтому направление есть всегда: плюс = вверх, минус = вниз.
-    direction, reason = ("UP" if score > 0 else "DOWN"), ""
+    feats = [
+        ("Тренд · EMA 9/21", "быстрая выше медленной", "быстрая ниже медленной",
+         (float(ema9.iloc[-1]) - float(ema21.iloc[-1])) / atr_last),
+        ("Импульс · RSI 14", "покупатели сильнее", "продавцы сильнее", (r - 50) / 20),
+        ("Моментум · MACD", "импульс растёт вверх", "импульс давит вниз", num(hist.iloc[-1]) / (atr_last * 0.5)),
+        ("Коридор · Bollinger", "цена выше средней линии", "цена ниже средней линии",
+         (price - num(mid.iloc[-1], price)) / sd),
+        ("Осциллятор · Stochastic", "сила быков", "сила медведей", (s_ - 50) / 25),
+    ]
 
     if atr_ratio < 0.8:
         vol = "низкая"
@@ -160,15 +152,25 @@ def analyze_df(df: pd.DataFrame) -> dict:
     else:
         vol = "нормальная"
 
+    return {"price": price, "feats": feats, "volatility": vol}
+
+
+def vote_now(base: dict) -> dict:
+    """Новый «раунд» голосования: сила индикатора + случайный шум. Каждое обновление может дать другой результат."""
+    votes = []
+    for name, up_txt, down_txt, x in base["feats"]:
+        v = 1 if math.tanh(x) + random.gauss(0, NOISE) > 0 else -1
+        votes.append((name, up_txt if v > 0 else down_txt, v))
+
+    score = sum(v for _, _, v in votes)  # 5 голосов -> всегда нечётное, ничьей нет
     return {
-        "price": price,
+        "price": base["price"],
+        "volatility": base["volatility"],
         "votes": votes,
         "score": score,
-        "direction": direction,
-        "reason": reason,
+        "direction": "UP" if score > 0 else "DOWN",
         "up": sum(1 for _, _, v in votes if v > 0),
         "down": sum(1 for _, _, v in votes if v < 0),
-        "volatility": vol,
     }
 
 
@@ -179,31 +181,26 @@ def fetch_and_analyze(ticker: str, interval: str) -> dict | None:
     key = (ticker, interval)
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_TTL:
-        return hit[1]
+        base = hit[1]
+    else:
+        # yfinance не умеет интервалы 30s и 3m: качаем минутные свечи,
+        # для 30S берём M1 как есть, для M3 собираем свечи по 3 минуты.
+        df = yf.download(ticker, period="5d", interval="1m", progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna(subset=["Close", "High", "Low"])
 
-    # yfinance не умеет интервалы 30s и 3m: качаем минутные свечи,
-    # для 30S берём M1 как есть, для M3 собираем свечи по 3 минуты.
-    df = yf.download(ticker, period="5d", interval="1m", progress=False, auto_adjust=True)
-    if df is None or df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.dropna(subset=["Close", "High", "Low"])
+        if interval == "3m":
+            df = df.resample("3min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        if len(df) < 60:
+            return None
 
-    last = df.index[-1]
-    last = last.tz_localize("UTC") if last.tzinfo is None else last.tz_convert("UTC")
-    age_min = (pd.Timestamp.now(tz="UTC") - last).total_seconds() / 60
+        base = analyze_df(df)
+        _cache[key] = (time.time(), base)
 
-    if interval == "3m":
-        df = df.resample("3min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
-    if len(df) < 60:
-        return None
-
-    result = analyze_df(df)
-    result["age_min"] = age_min
-    result["stale"] = age_min > TIMEFRAMES[interval][2]
-    _cache[key] = (time.time(), result)
-    return result
+    return vote_now(base)
 
 
 # ======================= ТЕКСТЫ =======================
@@ -502,39 +499,37 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
 
         decimals = 3 if "JPY" in pair else 5
-        marks = {1: "▲", -1: "▼"}
+        dots = "".join("🟢" if v > 0 else "🔴" for _, _, v in res["votes"])
         votes_txt = "\n".join(
-            f"{marks[v]} <b>{escape(name)}</b>\n    {escape(txt)}" for name, txt, v in res["votes"]
+            f"{'🟢' if v > 0 else '🔴'} <b>{escape(name)}</b>\n      <i>{escape(txt)}</i>"
+            for name, txt, v in res["votes"]
         )
 
         strength = "идеальный" if abs(res["score"]) == 5 else "стандартный"
         if res["direction"] == "UP":
-            head = f"🟢 <b>ВВЕРХ (CALL)</b> · {strength} сигнал"
-        elif res["direction"] == "DOWN":
-            head = f"🔴 <b>ВНИЗ (PUT)</b> · {strength} сигнал"
+            head = "🟢 <b>ВВЕРХ</b>  ·  CALL  ▲"
         else:
-            head = f"⚪ <b>СИГНАЛА НЕТ</b>\nПричина: {res['reason']}.\nЛучше пропустить вход."
+            head = "🔴 <b>ВНИЗ</b>  ·  PUT  ▼"
 
-        now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M МСК")
+        now = datetime.now(TZ).strftime("%d.%m.%Y · %H:%M:%S МСК")
         if tier == "vip":
             remaining = "💎 VIP — без ограничений"
         else:
-            remaining = f"🆓 Осталось анализов сегодня: {DAILY_LIMIT - rec['count']} из {DAILY_LIMIT}"
+            remaining = f"🆓 Осталось анализов: <b>{DAILY_LIMIT - rec['count']}</b> из {DAILY_LIMIT}"
 
         text = (
-            f"<b>📊 {pair} · {tf_name}</b>\n"
-            f"<code>{now}</code>\n"
+            f"<b>📊 {pair}</b>  ·  <b>{tf_name}</b>\n"
+            f"🕒 <code>{now}</code>\n"
+            f"{LINE}\n\n"
+            f"{head}\n"
+            f"Сигнал: <b>{strength}</b>\n"
+            f"Голоса: {dots}  <b>{res['up']}:{res['down']}</b>  (счёт {res['score']:+d})\n\n"
             f"{LINE}\n"
-            f"<b>РЕЗУЛЬТАТ</b>\n{head}\n\n"
-            f"Баланс голосов: <b>{res['score']:+d}</b>  "
-            f"(▲ {res['up']} · ▼ {res['down']})\n"
+            f"<b>ИНДИКАТОРЫ</b>\n\n{votes_txt}\n\n"
             f"{LINE}\n"
-            f"<b>ИНДИКАТОРЫ</b>\n{votes_txt}\n"
-            f"{LINE}\n"
-            f"<b>РЫНОК</b>\n"
-            f"Цена: <code>{res['price']:.{decimals}f}</code>\n"
-            f"Волатильность (ATR): {res['volatility']}\n"
-            f"Ориентир по экспирации: {expiry}\n"
+            f"💱 Цена: <code>{res['price']:.{decimals}f}</code>\n"
+            f"📈 Волатильность: {res['volatility']}\n"
+            f"⏱ Экспирация: <b>{expiry}</b>\n"
             f"{LINE}\n"
             f"{remaining}"
         )
