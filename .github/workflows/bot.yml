@@ -1,30 +1,53 @@
 name: Telegram bot
-
+ 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"
-
+    - cron: "17 */6 * * *"   # страховка: если цепочка перезапусков оборвалась, бот запустится сам
+ 
+# Одновременно работает только один запуск. Следующий ждёт в очереди, пока закончится текущий,
+# поэтому два бота никогда не опрашивают Telegram одновременно.
 concurrency:
   group: telegram-bot
-  cancel-in-progress: true
-
+  cancel-in-progress: false
+ 
+permissions:
+  contents: read
+  actions: write   # нужно, чтобы запуск мог сам запустить следующий
+ 
 jobs:
-  run:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+ 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -r requirements.txt
-      - name: Run bot
+ 
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+ 
+      - name: Run bot (до 5 ч 50 мин)
+        id: run
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           FREE_CHANNEL_ID: ${{ secrets.FREE_CHANNEL_ID }}
           VIP_CHANNEL_ID: ${{ secrets.VIP_CHANNEL_ID }}
           REF_LINK: ${{ secrets.REF_LINK }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
-        run: python bot.py
+        run: |
+          start=$(date +%s)
+          timeout 350m python bot.py || true
+          elapsed=$(( $(date +%s) - start ))
+          echo "elapsed=$elapsed" >> "$GITHUB_OUTPUT"
+ 
+      # Перезапуск: только если бот проработал дольше минуты.
+      # Если он падает сразу (неверный токен, ошибка в коде), цепочка останавливается, а не крутится вечно.
+      - name: Start next run
+        if: steps.run.outputs.elapsed > 60
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
