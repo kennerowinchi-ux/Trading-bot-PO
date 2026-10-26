@@ -265,7 +265,7 @@ WELCOME = (
     f"{LINE}\n"
     "Syndicate Trade - Специальный бот, созданный для анализа рынка и определением сигналов с последующим направлением рынка.\n"
     "Данный бот имеет возможность анализировать рынок 24/7, благодаря подключенному Claude AI 🚀 \n\n"
-    "<i>Доступ к боту имеют все подписчики телеграмм канала блогера Terret <i>\n\n"
+    "<i>Доступ к боту имеют все подписчики телеграмм канала блогера Terret</i>\n\n"
     f"{LINE}\n"
     "Выберите раздел:"
 )
@@ -688,6 +688,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        data = load_data()  # перечитываем: за время анализа админ мог изменить статусы
         rec = data["usage"].get(str(user.id))
         if not rec or rec["date"] != today():
             rec = {"date": today(), "count": 0}
