@@ -39,6 +39,26 @@ NOISE = 0.6     # «случайность» голосов: чем больше
 with open("pairs.json", encoding="utf-8") as f:
     PAIRS = json.load(f)  # {"EUR/USD": "EURUSD=X", ...}
 
+# Дополнительные пары. Значение — тикер Yahoo или список запасных вариантов (пробуются по очереди).
+# "X=Y" внутри строки "A/B" означает деление котировок A на B (кросс-курс), "inv:T" — обратный курс.
+EXTRA_PAIRS = {
+    "AUD/JPY": "AUDJPY=X",
+    "AUD/NZD OTC": "AUDNZD=X",
+    "CAD/JPY OTC": "CADJPY=X",
+    "CHF/JPY": "CHFJPY=X",
+    "CHF/NOK OTC": "CHFNOK=X",
+    "EUR/CHF": "EURCHF=X",
+    "EUR/RUB OTC": "EURRUB=X",
+    "GBP/JPY OTC": "GBPJPY=X",
+    "JOD/CNY OTC": ["JODCNY=X", "USDCNY=X/USDJOD=X"],
+    "MAD/USD OTC": ["MADUSD=X", "inv:USDMAD=X"],
+    "NZD/JPY OTC": "NZDJPY=X",
+    "NZD/USD OTC": "NZDUSD=X",
+    "QAR/CNY OTC": ["QARCNY=X", "USDCNY=X/USDQAR=X"],
+}
+for _name, _ticker in EXTRA_PAIRS.items():
+    PAIRS.setdefault(_name, _ticker)
+
 # код -> (название, ориентир по экспирации, максимальный возраст последней свечи в минутах)
 TIMEFRAMES = {
     "30s": ("30S", "30 сек", 10),
@@ -49,6 +69,7 @@ TIMEFRAMES = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMG_UP = os.path.join(BASE_DIR, "up.png")      # зелёное фото: график вверх
 IMG_DOWN = os.path.join(BASE_DIR, "down.png")  # красное фото: график вниз
+IMG_WELCOME = os.path.join(BASE_DIR, "welcome.png")    # фото главного меню
 IMG_APPROVED = os.path.join(BASE_DIR, "approved.png")  # заявка одобрена
 IMG_REJECTED = os.path.join(BASE_DIR, "rejected.png")  # заявка отклонена
 
@@ -233,20 +254,67 @@ def vote_now(base: dict) -> dict:
 _cache: dict = {}
 
 
-def fetch_and_analyze(ticker: str, interval: str) -> dict | None:
-    key = (ticker, interval)
+def _download_one(ticker: str) -> pd.DataFrame | None:
+    df = yf.download(ticker, period="5d", interval="1m", progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df.dropna(subset=["Close", "High", "Low"])
+
+
+def download_spec(spec: str) -> pd.DataFrame | None:
+    """'T' — обычный тикер; 'inv:T' — обратный курс; 'A/B' — кросс-курс A делить на B."""
+    cols = ["Open", "High", "Low", "Close"]
+    if spec.startswith("inv:"):
+        df = _download_one(spec[4:])
+        if df is None:
+            return None
+        inv = 1 / df[cols]
+        # при обращении максимум и минимум меняются местами
+        inv = inv.rename(columns={"High": "Low", "Low": "High"})
+        return inv[cols]
+    if "/" in spec:
+        a, b = spec.split("/", 1)
+        da, db = _download_one(a), _download_one(b)
+        if da is None or db is None:
+            return None
+        joined = da[cols].join(db[cols], how="inner", lsuffix="_a", rsuffix="_b")
+        if joined.empty:
+            return None
+        out = pd.DataFrame(index=joined.index)
+        for c in cols:
+            out[c] = joined[c + "_a"] / joined[c + "_b"]
+        out["High"] = out[["High", "Open", "Close"]].max(axis=1)
+        out["Low"] = out[["Low", "Open", "Close"]].min(axis=1)
+        return out
+    return _download_one(spec)
+
+
+def download_pair(ticker) -> pd.DataFrame | None:
+    specs = [ticker] if isinstance(ticker, str) else list(ticker)
+    for spec in specs:
+        try:
+            df = download_spec(spec)
+        except Exception as e:
+            log.warning("download %s failed: %s", spec, e)
+            continue
+        if df is not None and len(df) >= 60:
+            return df
+    return None
+
+
+def fetch_and_analyze(ticker, interval: str) -> dict | None:
+    key = (ticker if isinstance(ticker, str) else tuple(ticker), interval)
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_TTL:
         base = hit[1]
     else:
         # yfinance не умеет интервалы 30s и 3m: качаем минутные свечи,
         # для 30S берём M1 как есть, для M3 собираем свечи по 3 минуты.
-        df = yf.download(ticker, period="5d", interval="1m", progress=False, auto_adjust=True)
-        if df is None or df.empty:
+        df = download_pair(ticker)
+        if df is None:
             return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna(subset=["Close", "High", "Low"])
 
         if interval == "3m":
             df = df.resample("3min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
@@ -367,9 +435,8 @@ async def safe_edit(q, text: str, kb: InlineKeyboardMarkup | None = None):
             raise
 
 
-async def show_result(q, text: str, kb: InlineKeyboardMarkup, direction: str):
-    """Результат анализа с фото: зелёное для ВВЕРХ, красное для ВНИЗ."""
-    path = IMG_UP if direction == "UP" else IMG_DOWN
+async def show_photo(q, path: str, text: str, kb: InlineKeyboardMarkup):
+    """Показывает фото с подписью. Если файла нет — обычный текст."""
     if not os.path.exists(path):
         await safe_edit(q, text, kb)
         return
@@ -391,6 +458,11 @@ async def show_result(q, text: str, kb: InlineKeyboardMarkup, direction: str):
         pass
 
 
+async def show_result(q, text: str, kb: InlineKeyboardMarkup, direction: str):
+    """Результат анализа с фото: зелёное для ВВЕРХ, красное для ВНИЗ."""
+    await show_photo(q, IMG_UP if direction == "UP" else IMG_DOWN, text, kb)
+
+
 # ======================= КОМАНДЫ =======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tier = await user_tier(context.bot, update.effective_user.id)
@@ -399,7 +471,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             LOCKED, parse_mode=ParseMode.HTML, reply_markup=subscribe_keyboard()
         )
         return
-    await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu())
+    if os.path.exists(IMG_WELCOME):
+        with open(IMG_WELCOME, "rb") as f:
+            await update.message.reply_photo(f, caption=WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu())
+    else:
+        await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu())
 
 
 async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -563,7 +639,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "menu":
-        await safe_edit(q, WELCOME, main_menu())
+        await show_photo(q, IMG_WELCOME, WELCOME, main_menu())
 
     elif action == "method":
         await safe_edit(q, METHOD, InlineKeyboardMarkup([back_row()]))
@@ -715,6 +791,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"<b>📊 {pair}</b>  ·  <b>{tf_name}</b>\n"
             f"🕒 <code>{now}</code>\n"
+            f"📋 Пара: <code>{escape(pair)}</code> <i>(нажмите, чтобы скопировать)</i>\n"
             f"{LINE}\n\n"
             f"{verdict}\n\n"
             f"{LINE}\n"
