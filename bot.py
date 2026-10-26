@@ -70,8 +70,50 @@ def load_data() -> dict:
 
 
 def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, DATA_FILE)  # файл не повредится, даже если бот упадёт во время записи
+
+
+async def backup_data(bot) -> None:
+    """Копия базы уходит админу в Telegram и закрепляется. Из неё бот восстанавливается после перезапуска."""
+    if not ADMIN_ID:
+        return
+    try:
+        old = (await bot.get_chat(ADMIN_ID)).pinned_message
+        with open(DATA_FILE, "rb") as f:
+            msg = await bot.send_document(
+                ADMIN_ID, f, filename="data.json", caption="💾 Резервная копия базы", disable_notification=True
+            )
+        await bot.pin_chat_message(ADMIN_ID, msg.message_id, disable_notification=True)
+        if old and old.document and old.document.file_name == "data.json":
+            await bot.unpin_chat_message(ADMIN_ID, old.message_id)
+    except Exception as e:
+        log.warning("Не удалось сохранить резервную копию: %s", e)
+
+
+async def restore_data(app) -> None:
+    """При старте подтягивает базу из закреплённого файла у админа и объединяет с локальной."""
+    if not ADMIN_ID:
+        return
+    try:
+        pinned = (await app.bot.get_chat(ADMIN_ID)).pinned_message
+        if not (pinned and pinned.document and pinned.document.file_name == "data.json"):
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw = await tg_file.download_as_bytearray()
+        remote = json.loads(bytes(raw).decode("utf-8"))
+    except Exception as e:
+        log.warning("Не удалось восстановить базу: %s", e)
+        return
+
+    data = load_data()
+    data["approved"] = sorted(set(data["approved"]) | set(remote.get("approved", [])))
+    data["rejected"] = [u for u in sorted(set(data["rejected"]) | set(remote.get("rejected", []))) if u not in data["approved"]]
+    data["uids"] = {**remote.get("uids", {}), **data["uids"]}
+    save_data(data)
+    log.info("База восстановлена: подтверждённых %d", len(data["approved"]))
 
 
 def today() -> str:
@@ -219,11 +261,7 @@ def fetch_and_analyze(ticker: str, interval: str) -> dict | None:
 
 # ======================= ТЕКСТЫ =======================
 WELCOME = (
-    "<b>📈 Syndicate Trade </b>\n"
-    f"{LINE}\n"
-    " Syndicate Trade - Специальный бот, созданный для анализа рынка и определением сигналов с последующим направлением рынка.\n"
-    " Данный бот имеет возможность анализировать рынок 24/7, благодаря подключенному Claude AI 🚀 \n\n"
-    "<i> Доступ к боту имеют все подписчики телеграмм канала блогера Terret </i>\n\n"
+    "<b>📈 Система 50/50</b>\n"
     f"{LINE}\n"
     "Выберите раздел:"
 )
@@ -373,6 +411,9 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = context.args[0][:32]
     data = load_data()
+    if user.id in data["approved"]:
+        await update.message.reply_text("✅ Ваша регистрация уже подтверждена, повторно отправлять ID не нужно.")
+        return
     data["uids"][str(user.id)] = uid
     if user.id in data["rejected"]:
         data["rejected"].remove(user.id)
@@ -430,6 +471,7 @@ async def decide(bot, uid: int, approved: bool) -> bool:
             "Отправьте ID заново: <code>/uid 12345678</code>"
         )
     save_data(data)
+    await backup_data(bot)
     img = IMG_APPROVED if approved else IMG_REJECTED
     try:
         if os.path.exists(img):
@@ -697,7 +739,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(restore_data).build()
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("uid", uid_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
