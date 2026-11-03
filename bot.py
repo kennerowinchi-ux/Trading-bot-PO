@@ -1,10 +1,13 @@
 import asyncio
+import base64
 import json
 import logging
 import math
 import os
 import random
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from html import escape
 from zoneinfo import ZoneInfo
@@ -32,6 +35,11 @@ CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "Terret911")
 DAILY_LIMIT = 10
 TZ = ZoneInfo("Europe/Moscow")
 DATA_FILE = "data.json"
+BACKUP_KEY = os.getenv("BACKUP_KEY", "")  # необязательно: если задан, файл в репозитории шифруется
+REPO_FILE = "data.enc" if BACKUP_KEY else "registrations.json"  # копия регистраций в репозитории (usage в неё не входит)
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")  # owner/repo, задаётся GitHub Actions сам
+GITHUB_BRANCH = os.getenv("GITHUB_REF_NAME", "main")
 CACHE_TTL = 45  # секунд (кэш котировок)
 ALT_PROB = 0.5   # вероятность, что направление сменится на противоположное предыдущему (0 = только естественный шанс 50%; 1 = всегда меняется)
 LOAD_MIN, LOAD_MAX = 5, 10  # длительность «анализа» в секундах
@@ -56,9 +64,16 @@ PAIRS_OTC = {
 
 # Обычные графики (без приписки OTC)
 PAIRS_REAL = {
-    "AUD/JPY": "AUDJPY=X",
-    "CHF/JPY": "CHFJPY=X",
-    "EUR/CHF": "EURCHF=X",
+    "USD/CHF": "USDCHF=X",       # 81%
+    "CHF/JPY": "CHFJPY=X",       # 80%
+    "EUR/JPY": "EURJPY=X",       # 78%
+    "AUD/CHF": "AUDCHF=X",       # 77%
+    "AUD/CAD": "AUDCAD=X",       # 75%
+    "AUD/JPY": "AUDJPY=X",       # 73%
+    "EUR/CHF": "EURCHF=X",       # 73%
+    "EUR/USD": "EURUSD=X",       # 73%
+    "AUD/USD": "AUDUSD=X",       # 70%
+    "CAD/CHF": ["CADCHF=X", "USDCHF=X/USDCAD=X"],  # 68%
 }
 
 PAIRS = {**PAIRS_OTC, **PAIRS_REAL}
@@ -112,35 +127,141 @@ def save_data(data: dict) -> None:
     os.replace(tmp, DATA_FILE)  # файл не повредится, даже если бот упадёт во время записи
 
 
-_restored = False  # True, когда база уже подтянута из Telegram (или подтягивать нечего)
+_restored = False  # True, когда база уже подтянута из хранилищ (или подтягивать нечего)
+_REG_KEYS = ("approved", "rejected", "uids")
+
+
+def _fernet():
+    if not BACKUP_KEY:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+
+        return Fernet(BACKUP_KEY.encode())
+    except Exception as e:
+        log.warning("BACKUP_KEY неверный или нет библиотеки cryptography: %s", e)
+        return None
+
+
+def read_repo_copy() -> dict | None:
+    """Копия регистраций из репозитория (приходит вместе с checkout)."""
+    if not os.path.exists(REPO_FILE):
+        return None
+    try:
+        with open(REPO_FILE, "rb") as fh:
+            raw = fh.read()
+        if BACKUP_KEY:
+            f = _fernet()
+            if not f:
+                return None
+            raw = f.decrypt(raw)
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        log.warning("Не удалось прочитать %s: %s", REPO_FILE, e)
+        return None
+
+
+def _github_put(content: bytes) -> None:
+    """Обновляет (или создаёт) файл в репозитории через GitHub API. Блокирующая функция."""
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/{REPO_FILE}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "syndicate-bot",
+    }
+    sha = None
+    try:
+        req = urllib.request.Request(f"{url}?ref={GITHUB_BRANCH}", headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            sha = json.loads(r.read().decode("utf-8")).get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    body = {
+        "message": "Обновление базы регистраций",
+        "content": base64.b64encode(content).decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), headers={**headers, "Content-Type": "application/json"}, method="PUT"
+    )
+    urllib.request.urlopen(req, timeout=30).read()
+
+
+async def push_repo_copy() -> None:
+    if not (GITHUB_TOKEN and GITHUB_REPOSITORY):
+        log.info("Запись в репозиторий выключена (нужны GITHUB_TOKEN и GITHUB_REPOSITORY)")
+        return
+    data = load_data()
+    payload = {k: data[k] for k in _REG_KEYS}
+    payload["reg_ts"] = data.get("reg_ts", 0)
+    raw = json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
+    if BACKUP_KEY:
+        f = _fernet()
+        if not f:
+            return  # ключ задан, но не работает: открытым текстом не пишем
+        raw = f.encrypt(raw)
+    try:
+        await asyncio.to_thread(_github_put, raw)
+        log.info("База регистраций записана в репозиторий (%s)", REPO_FILE)
+    except Exception as e:
+        log.warning("Не удалось записать базу в репозиторий: %s", e)
+
+
+def mark_registration_changed(data: dict) -> None:
+    data["reg_ts"] = time.time()
 
 
 async def ensure_restored(bot) -> bool:
-    """Подтягивает базу из закреплённого файла у админа и объединяет с локальной.
-    Пока это не удалось, резервные копии не перезаписываются — иначе можно затереть хорошую копию пустой."""
+    """Собирает базу регистраций из локального файла, репозитория и Telegram и берёт самую свежую версию.
+    Пока Telegram не ответил, резервные копии не перезаписываются — иначе можно затереть хорошую копию пустой."""
     global _restored
     if _restored:
         return True
-    if not ADMIN_ID:
-        _restored = True
-        return True
-    try:
-        pinned = (await bot.get_chat(ADMIN_ID)).pinned_message
-        if pinned and pinned.document and pinned.document.file_name == "data.json":
-            tg_file = await bot.get_file(pinned.document.file_id)
-            raw = await tg_file.download_as_bytearray()
-            remote = json.loads(bytes(raw).decode("utf-8"))
-            data = load_data()
-            data["approved"] = sorted(set(data["approved"]) | set(remote.get("approved", [])))
-            data["rejected"] = [
-                u for u in sorted(set(data["rejected"]) | set(remote.get("rejected", []))) if u not in data["approved"]
-            ]
-            data["uids"] = {**remote.get("uids", {}), **data["uids"]}
-            save_data(data)
-            log.info("База восстановлена: подтверждённых %d", len(data["approved"]))
-        _restored = True
-    except Exception as e:
-        log.warning("Не удалось восстановить базу (повторю при следующем действии): %s", e)
+
+    ok = True
+    candidates = []
+    if os.path.exists(DATA_FILE):
+        candidates.append(load_data())
+    repo = read_repo_copy()
+    if repo:
+        candidates.append(repo)
+
+    if ADMIN_ID:
+        try:
+            pinned = (await bot.get_chat(ADMIN_ID)).pinned_message
+            if pinned and pinned.document and pinned.document.file_name == "data.json":
+                tg_file = await bot.get_file(pinned.document.file_id)
+                raw = await tg_file.download_as_bytearray()
+                candidates.append(json.loads(bytes(raw).decode("utf-8")))
+        except Exception as e:
+            ok = False
+            log.warning("Не удалось получить копию из Telegram (повторю при следующем действии): %s", e)
+
+    if candidates:
+        data = load_data()
+        newest = max(candidates, key=lambda c: c.get("reg_ts", 0))
+        if newest.get("reg_ts", 0) > 0:
+            # у версий есть метка времени: берём самую свежую целиком (так отзыв доступа не откатывается)
+            for k in _REG_KEYS:
+                data[k] = newest.get(k, data[k])
+            data["reg_ts"] = newest["reg_ts"]
+        else:
+            # старые копии без метки: объединяем
+            data["approved"] = sorted(set().union(*[set(c.get("approved", [])) for c in candidates]))
+            rej = set().union(*[set(c.get("rejected", [])) for c in candidates])
+            data["rejected"] = sorted(u for u in rej if u not in data["approved"])
+            uids = {}
+            for c in candidates:
+                uids.update(c.get("uids", {}))
+            data["uids"] = uids
+        save_data(data)
+        log.info("База восстановлена: подтверждённых %d", len(data["approved"]))
+
+    _restored = ok
     return _restored
 
 
@@ -149,24 +270,24 @@ async def restore_data(app) -> None:
 
 
 async def backup_data(bot) -> None:
-    """Копия базы уходит админу в Telegram и закрепляется. Из неё бот восстанавливается после любого перезапуска,
-    даже на чистой машине: компьютер владельца для этого включать не нужно."""
-    if not ADMIN_ID:
-        return
+    """Сохраняет базу регистраций: файлом в Telegram (закреплён у админа) и зашифрованной копией в репозитории.
+    Из них бот восстанавливается после любого перезапуска, даже на чистой машине."""
     if not await ensure_restored(bot):
         log.warning("Резервная копия пропущена: база ещё не восстановлена, чтобы не затереть старую копию")
         return
-    try:
-        old = (await bot.get_chat(ADMIN_ID)).pinned_message
-        with open(DATA_FILE, "rb") as f:
-            msg = await bot.send_document(
-                ADMIN_ID, f, filename="data.json", caption="💾 Резервная копия базы", disable_notification=True
-            )
-        await bot.pin_chat_message(ADMIN_ID, msg.message_id, disable_notification=True)
-        if old and old.document and old.document.file_name == "data.json":
-            await bot.unpin_chat_message(ADMIN_ID, old.message_id)
-    except Exception as e:
-        log.warning("Не удалось сохранить резервную копию: %s", e)
+    if ADMIN_ID:
+        try:
+            old = (await bot.get_chat(ADMIN_ID)).pinned_message
+            with open(DATA_FILE, "rb") as f:
+                msg = await bot.send_document(
+                    ADMIN_ID, f, filename="data.json", caption="💾 Резервная копия базы", disable_notification=True
+                )
+            await bot.pin_chat_message(ADMIN_ID, msg.message_id, disable_notification=True)
+            if old and old.document and old.document.file_name == "data.json":
+                await bot.unpin_chat_message(ADMIN_ID, old.message_id)
+        except Exception as e:
+            log.warning("Не удалось сохранить резервную копию в Telegram: %s", e)
+    await push_repo_copy()
 
 
 async def backup_on_stop(app) -> None:
@@ -582,6 +703,7 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["uids"][str(user.id)] = uid
     if user.id in data["rejected"]:
         data["rejected"].remove(user.id)
+    mark_registration_changed(data)
     save_data(data)
     await backup_data(context.bot)
     await update.message.reply_text(
@@ -637,6 +759,7 @@ async def decide(bot, uid: int, approved: bool) -> bool:
             "из раздела «Регистрация» и указали верный ID.\n\n"
             "Отправьте ID заново: <code>/uid 12345678</code>"
         )
+    mark_registration_changed(data)
     save_data(data)
     await backup_data(bot)
     img = IMG_APPROVED if approved else IMG_REJECTED
