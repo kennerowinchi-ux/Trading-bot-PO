@@ -33,37 +33,52 @@ DAILY_LIMIT = 10
 TZ = ZoneInfo("Europe/Moscow")
 DATA_FILE = "data.json"
 CACHE_TTL = 45  # секунд (кэш котировок)
+ALT_PROB = 0.5   # вероятность, что направление сменится на противоположное предыдущему (0 = только естественный шанс 50%; 1 = всегда меняется)
+LOAD_MIN, LOAD_MAX = 5, 10  # длительность «анализа» в секундах
 NOISE = 0.6     # «случайность» голосов: чем больше, тем сильнее результат меняется при обновлении
 
 
-with open("pairs.json", encoding="utf-8") as f:
-    PAIRS = json.load(f)  # {"EUR/USD": "EURUSD=X", ...}
-
-# Дополнительные пары. Значение — тикер Yahoo или список запасных вариантов (пробуются по очереди).
-# "X=Y" внутри строки "A/B" означает деление котировок A на B (кросс-курс), "inv:T" — обратный курс.
-EXTRA_PAIRS = {
-    "AUD/JPY": "AUDJPY=X",
-    "AUD/NZD OTC": "AUDNZD=X",
-    "CAD/JPY OTC": "CADJPY=X",
-    "CHF/JPY": "CHFJPY=X",
-    "CHF/NOK OTC": "CHFNOK=X",
-    "EUR/CHF": "EURCHF=X",
-    "EUR/RUB OTC": "EURRUB=X",
-    "GBP/JPY OTC": "GBPJPY=X",
-    "JOD/CNY OTC": ["JODCNY=X", "USDCNY=X/USDJOD=X"],
-    "MAD/USD OTC": ["MADUSD=X", "inv:USDMAD=X"],
-    "NZD/JPY OTC": "NZDJPY=X",
-    "NZD/USD OTC": "NZDUSD=X",
-    "QAR/CNY OTC": ["QARCNY=X", "USDCNY=X/USDQAR=X"],
+# Список пар (pairs.json больше не используется).
+# Значение — тикер Yahoo или список запасных вариантов (пробуются по очереди).
+# "A/B" — кросс-курс (A делить на B), "inv:T" — обратный курс.
+PAIRS_OTC = {
+    "AED/CNY OTC": ["AEDCNY=X", "USDCNY=X/USDAED=X"],
+    "AUD/CHF OTC": "AUDCHF=X",
+    "AUD/USD OTC": "AUDUSD=X",
+    "EUR/CHF OTC": "EURCHF=X",
+    "EUR/USD OTC": "EURUSD=X",
+    "NGN/USD OTC": ["NGNUSD=X", "inv:USDNGN=X"],
+    "USD/IDR OTC": "USDIDR=X",
+    "USD/PKR OTC": "USDPKR=X",
+    "USD/THB OTC": "USDTHB=X",
+    "USD/VND OTC": "USDVND=X",
 }
-for _name, _ticker in EXTRA_PAIRS.items():
-    PAIRS.setdefault(_name, _ticker)
+
+# Обычные графики (без приписки OTC)
+PAIRS_REAL = {
+    "AUD/JPY": "AUDJPY=X",
+    "CHF/JPY": "CHFJPY=X",
+    "EUR/CHF": "EURCHF=X",
+}
+
+PAIRS = {**PAIRS_OTC, **PAIRS_REAL}
+MARKETS = {
+    "otc": ("💱 Графики OTC", PAIRS_OTC, ["15s", "30s", "1m", "3m", "5m"]),
+    "real": ("📈 Обычные графики", PAIRS_REAL, ["1m", "3m", "5m", "30m"]),
+}
+
+
+def pair_kind(pair: str) -> str:
+    return "otc" if pair in PAIRS_OTC else "real"
 
 # код -> (название, ориентир по экспирации, максимальный возраст последней свечи в минутах)
 TIMEFRAMES = {
-    "30s": ("30S", "30 сек", 10),
-    "1m": ("M1", "1 мин", 25),
-    "3m": ("M3", "3 мин", 50),
+    "15s": ("15S", "15 сек", None),
+    "30s": ("30S", "30 сек", None),
+    "1m": ("M1", "1 мин", None),
+    "3m": ("M3", "3 мин", "3min"),
+    "5m": ("M5", "5 мин", "5min"),
+    "30m": ("M30", "30 мин", "30min"),
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -97,9 +112,49 @@ def save_data(data: dict) -> None:
     os.replace(tmp, DATA_FILE)  # файл не повредится, даже если бот упадёт во время записи
 
 
-async def backup_data(bot) -> None:
-    """Копия базы уходит админу в Telegram и закрепляется. Из неё бот восстанавливается после перезапуска."""
+_restored = False  # True, когда база уже подтянута из Telegram (или подтягивать нечего)
+
+
+async def ensure_restored(bot) -> bool:
+    """Подтягивает базу из закреплённого файла у админа и объединяет с локальной.
+    Пока это не удалось, резервные копии не перезаписываются — иначе можно затереть хорошую копию пустой."""
+    global _restored
+    if _restored:
+        return True
     if not ADMIN_ID:
+        _restored = True
+        return True
+    try:
+        pinned = (await bot.get_chat(ADMIN_ID)).pinned_message
+        if pinned and pinned.document and pinned.document.file_name == "data.json":
+            tg_file = await bot.get_file(pinned.document.file_id)
+            raw = await tg_file.download_as_bytearray()
+            remote = json.loads(bytes(raw).decode("utf-8"))
+            data = load_data()
+            data["approved"] = sorted(set(data["approved"]) | set(remote.get("approved", [])))
+            data["rejected"] = [
+                u for u in sorted(set(data["rejected"]) | set(remote.get("rejected", []))) if u not in data["approved"]
+            ]
+            data["uids"] = {**remote.get("uids", {}), **data["uids"]}
+            save_data(data)
+            log.info("База восстановлена: подтверждённых %d", len(data["approved"]))
+        _restored = True
+    except Exception as e:
+        log.warning("Не удалось восстановить базу (повторю при следующем действии): %s", e)
+    return _restored
+
+
+async def restore_data(app) -> None:
+    await ensure_restored(app.bot)
+
+
+async def backup_data(bot) -> None:
+    """Копия базы уходит админу в Telegram и закрепляется. Из неё бот восстанавливается после любого перезапуска,
+    даже на чистой машине: компьютер владельца для этого включать не нужно."""
+    if not ADMIN_ID:
+        return
+    if not await ensure_restored(bot):
+        log.warning("Резервная копия пропущена: база ещё не восстановлена, чтобы не затереть старую копию")
         return
     try:
         old = (await bot.get_chat(ADMIN_ID)).pinned_message
@@ -114,27 +169,9 @@ async def backup_data(bot) -> None:
         log.warning("Не удалось сохранить резервную копию: %s", e)
 
 
-async def restore_data(app) -> None:
-    """При старте подтягивает базу из закреплённого файла у админа и объединяет с локальной."""
-    if not ADMIN_ID:
-        return
-    try:
-        pinned = (await app.bot.get_chat(ADMIN_ID)).pinned_message
-        if not (pinned and pinned.document and pinned.document.file_name == "data.json"):
-            return
-        tg_file = await app.bot.get_file(pinned.document.file_id)
-        raw = await tg_file.download_as_bytearray()
-        remote = json.loads(bytes(raw).decode("utf-8"))
-    except Exception as e:
-        log.warning("Не удалось восстановить базу: %s", e)
-        return
-
-    data = load_data()
-    data["approved"] = sorted(set(data["approved"]) | set(remote.get("approved", [])))
-    data["rejected"] = [u for u in sorted(set(data["rejected"]) | set(remote.get("rejected", []))) if u not in data["approved"]]
-    data["uids"] = {**remote.get("uids", {}), **data["uids"]}
-    save_data(data)
-    log.info("База восстановлена: подтверждённых %d", len(data["approved"]))
+async def backup_on_stop(app) -> None:
+    """Перед остановкой (плановый перезапуск раз в ~6 часов) сохраняем свежую копию."""
+    await backup_data(app.bot)
 
 
 def today() -> str:
@@ -225,12 +262,26 @@ def analyze_df(df: pd.DataFrame) -> dict:
     return {"price": price, "atr": atr_last, "feats": feats, "volatility": vol}
 
 
-def vote_now(base: dict) -> dict:
-    """Новый «раунд» голосования: сила индикатора + случайный шум. Каждое обновление может дать другой результат."""
+_last_dir: dict = {}  # user_id -> последнее выпавшее направление (+1 вверх, -1 вниз)
+
+
+def vote_now(base: dict, last_dir: int = 0) -> dict:
+    """Новый «раунд» голосования: сила индикатора + шум. После прошлого результата направление
+    с вероятностью ALT_PROB меняется на противоположное (вниз -> чаще вверх и наоборот)."""
     votes = []
     for name, up_txt, down_txt, x in base["feats"]:
         v = 1 if math.tanh(x) + random.gauss(0, NOISE) > 0 else -1
-        votes.append((name, up_txt if v > 0 else down_txt, v))
+        votes.append([name, up_txt, down_txt, x, v])
+
+    # Если нужна смена направления, а выпало то же самое — переворачиваем самых «неуверенных» судей
+    want = -last_dir if last_dir and random.random() < ALT_PROB else 0
+    if want and sum(v[4] for v in votes) * want < 0:
+        need = random.choice([1, 3, 3, 5])  # с какой силой должен выйти новый результат
+        for v in sorted((v for v in votes if v[4] != want), key=lambda v: abs(math.tanh(v[3]))):
+            v[4] = want
+            if sum(j[4] for j in votes) * want >= need:
+                break
+    votes = [(name, up_txt if v > 0 else down_txt, v) for name, up_txt, down_txt, _, v in votes]
 
     score = sum(v for _, _, v in votes)  # 5 голосов -> всегда нечётное, ничьей нет
 
@@ -304,27 +355,28 @@ def download_pair(ticker) -> pd.DataFrame | None:
     return None
 
 
-def fetch_and_analyze(ticker, interval: str) -> dict | None:
+def fetch_and_analyze(ticker, interval: str, last_dir: int = 0) -> dict | None:
     key = (ticker if isinstance(ticker, str) else tuple(ticker), interval)
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_TTL:
         base = hit[1]
     else:
         # yfinance не умеет интервалы 30s и 3m: качаем минутные свечи,
-        # для 30S берём M1 как есть, для M3 собираем свечи по 3 минуты.
+        # для 15S/30S берём M1 как есть, а M3/M5/M30 собираем из минутных свечей.
         df = download_pair(ticker)
         if df is None:
             return None
 
-        if interval == "3m":
-            df = df.resample("3min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        rule = TIMEFRAMES[interval][2]
+        if rule:
+            df = df.resample(rule).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
         if len(df) < 60:
             return None
 
         base = analyze_df(df)
         _cache[key] = (time.time(), base)
 
-    return vote_now(base)
+    return vote_now(base, last_dir)
 
 
 # ======================= ТЕКСТЫ =======================
@@ -355,7 +407,7 @@ METHOD = (
     "Счет от ±1 до ±3 — Стандартный сигнал. Большинство судей перевесило чашу весов.\n\n"
     "<b>4. Сигнал.</b> Бот всегда показывает направление: плюс — ВВЕРХ, минус — ВНИЗ. "
     "Ничьей не бывает, так как судей пять.\n\n"
-    "<b>5. Экспирация.</b> Мы пользуемся тремя видами таймфрема (30S, M1, M3). "
+    "<b>5. Экспирация.</b> Для OTC-графиков доступны 15S, 30S, M1, M3, M5, для обычных — M1, M3, M5, M30. "
     "На личном опыте я выделили именно эти три таймфрейма\n\n"
     f"{LINE}"
 )
@@ -435,6 +487,38 @@ async def safe_edit(q, text: str, kb: InlineKeyboardMarkup | None = None):
             raise
 
 
+async def set_loading(q, text: str):
+    """Показывает экран загрузки (без кнопок). Если сейчас на экране фото — меняет только подпись."""
+    try:
+        if q.message is not None and q.message.photo:
+            await q.edit_message_caption(caption=text, parse_mode=ParseMode.HTML)
+        else:
+            await safe_edit(q, text)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def analyze_with_loading(q, pair: str, tf_name: str, ticker, tf: str, last_dir: int):
+    """Запускает расчёт и параллельно показывает «идёт анализ» 5–10 секунд."""
+    task = asyncio.create_task(asyncio.to_thread(fetch_and_analyze, ticker, tf, last_dir))
+    steps = [
+        "📡 Загружаю котировки",
+        "📊 Считаю индикаторы",
+        "⚖️ Судьи голосуют",
+        "🧮 Подвожу итог",
+    ]
+    total = random.uniform(LOAD_MIN, LOAD_MAX)
+    pause = total / len(steps)
+    for i, step in enumerate(steps, 1):
+        bar = "▰" * i + "▱" * (len(steps) - i)
+        await set_loading(
+            q, f"⏳ <b>{escape(pair)} · {tf_name}</b>\n{LINE}\n<b>Идёт анализ…</b>\n\n{step}\n<code>{bar}</code>"
+        )
+        await asyncio.sleep(pause)
+    return await task
+
+
 async def show_photo(q, path: str, text: str, kb: InlineKeyboardMarkup):
     """Показывает фото с подписью. Если файла нет — обычный текст."""
     if not os.path.exists(path):
@@ -490,6 +574,7 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     uid = context.args[0][:32]
+    await ensure_restored(context.bot)
     data = load_data()
     if user.id in data["approved"]:
         await update.message.reply_text("✅ Ваша регистрация уже подтверждена, повторно отправлять ID не нужно.")
@@ -498,6 +583,7 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id in data["rejected"]:
         data["rejected"].remove(user.id)
     save_data(data)
+    await backup_data(context.bot)
     await update.message.reply_text(
         "✅ <b>ID получен.</b>\nЗаявка отправлена на проверку, статус появится в разделе «Профиль».",
         parse_mode=ParseMode.HTML,
@@ -526,6 +612,7 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def decide(bot, uid: int, approved: bool) -> bool:
     """Фиксирует решение админа и пишет пользователю. Возвращает True, если пользователю удалось написать."""
+    await ensure_restored(bot)
     data = load_data()
     if approved:
         if uid not in data["approved"]:
@@ -617,11 +704,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, LOCKED, subscribe_keyboard())
         return
 
+    await ensure_restored(context.bot)
     data = load_data()
     action = q.data
 
     # Анализ рынка доступен только после подтверждения регистрации администратором
-    needs_approval = action == "pairs" or action.startswith("pair:") or action.startswith("sig:")
+    needs_approval = action in ("pairs",) or action.startswith(("list:", "pair:", "sig:"))
     if needs_approval and user.id not in data["approved"] and user.id != ADMIN_ID:
         await safe_edit(
             q,
@@ -692,28 +780,52 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, text, InlineKeyboardMarkup([back_row()]))
 
     elif action == "pairs":
-        names = list(PAIRS.keys())
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(MARKETS["otc"][0], callback_data="list:otc")],
+                [InlineKeyboardButton(MARKETS["real"][0], callback_data="list:real")],
+                back_row(),
+            ]
+        )
+        await safe_edit(
+            q,
+            "<b>📊 Анализ рынка</b>\n"
+            f"{LINE}\n"
+            "Выберите тип графика:\n\n"
+            "💱 <b>OTC</b> — экспирация 15S, 30S, M1, M3, M5\n"
+            "📈 <b>Обычные</b> — экспирация M1, M3, M5, M30",
+            kb,
+        )
+
+    elif action.startswith("list:"):
+        kind = action[5:]
+        if kind not in MARKETS:
+            return
+        title, pairs, _ = MARKETS[kind]
+        names = list(pairs.keys())
         rows = [
             [InlineKeyboardButton(n, callback_data=f"pair:{n}") for n in names[i : i + 2]]
             for i in range(0, len(names), 2)
         ]
-        rows.append(back_row())
-        await safe_edit(q, "Выберите пару:", InlineKeyboardMarkup(rows))
+        rows.append([InlineKeyboardButton("⬅️ К выбору типа", callback_data="pairs")])
+        await safe_edit(q, f"<b>{title}</b>\n{LINE}\nВыберите пару:", InlineKeyboardMarkup(rows))
 
     elif action.startswith("pair:"):
         pair = action[5:]
         if pair not in PAIRS:
             return
-        row = [
-            InlineKeyboardButton(f"{name} · экспирация {exp}", callback_data=f"sig:{pair}:{code}")
-            for code, (name, exp, _) in TIMEFRAMES.items()
+        kind = pair_kind(pair)
+        kb = [
+            [InlineKeyboardButton(f"{TIMEFRAMES[code][0]} · экспирация {TIMEFRAMES[code][1]}",
+                                  callback_data=f"sig:{pair}:{code}")]
+            for code in MARKETS[kind][2]
         ]
-        kb = [[b] for b in row] + [[InlineKeyboardButton("⬅️ К выбору пары", callback_data="pairs")]]
+        kb.append([InlineKeyboardButton("⬅️ К выбору пары", callback_data=f"list:{kind}")])
         await safe_edit(
             q,
-            f"<b>📊 {pair}</b>\n"
+            f"<b>📊 {escape(pair)}</b>\n"
             f"{LINE}\n"
-            "Шаг 2 из 2 — выберите таймфрейм.\n\n"
+            "Шаг 2 из 2 — выберите время захода в сделку.\n\n"
             "<i>Таймфрейм - Время, на которое вы входите в сделку.</i>",
             InlineKeyboardMarkup(kb),
         )
@@ -723,7 +835,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, pair, tf = action.split(":")
         except ValueError:
             return
-        if pair not in PAIRS or tf not in TIMEFRAMES:
+        if pair not in PAIRS or tf not in MARKETS[pair_kind(pair)][2]:
             return
 
         if tier == "free" and used_today(data, user.id) >= DAILY_LIMIT:
@@ -744,16 +856,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tf_name, expiry, _ = TIMEFRAMES[tf]
-        if not (q.message is not None and q.message.photo):
-            await safe_edit(q, f"⏳ <b>{pair} · {tf_name}</b>\nЗагружаю котировки и считаю индикаторы…")
-
         try:
-            res = await asyncio.to_thread(fetch_and_analyze, PAIRS[pair], tf)
+            res = await analyze_with_loading(q, pair, tf_name, PAIRS[pair], tf, _last_dir.get(user.id, 0))
         except Exception as e:
             log.exception("analysis failed: %s", e)
             res = None
 
-        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Другая пара", callback_data="pairs")], back_row()])
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Другая пара", callback_data=f"list:{pair_kind(pair)}")], back_row()])
 
         if res is None:
             await safe_edit(
@@ -772,7 +881,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["usage"][str(user.id)] = rec
         save_data(data)
 
-        decimals = 3 if "JPY" in pair else 5
+        _last_dir[user.id] = 1 if res["direction"] == "UP" else -1
+        p = res["price"]
+        decimals = 2 if p >= 1000 else 3 if p >= 100 else 4 if p >= 10 else 5 if p >= 0.1 else 7
         dots = "".join("🟢" if v > 0 else "🔴" for _, _, v in res["votes"])
         votes_txt = "\n".join(
             f"{'🟢' if v > 0 else '🔴'} <b>{escape(name)}</b>\n      <i>{escape(txt)}</i>"
@@ -809,7 +920,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔄 Обновить", callback_data=f"sig:{pair}:{tf}")],
                 [
                     InlineKeyboardButton("🕒 Другой таймфрейм", callback_data=f"pair:{pair}"),
-                    InlineKeyboardButton("💱 Другая пара", callback_data="pairs"),
+                    InlineKeyboardButton("💱 Другая пара", callback_data=f"list:{pair_kind(pair)}"),
                 ],
                 [
                     InlineKeyboardButton("📚 Методика", callback_data="method"),
@@ -821,7 +932,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(restore_data).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(restore_data).post_stop(backup_on_stop).build()
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("uid", uid_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
