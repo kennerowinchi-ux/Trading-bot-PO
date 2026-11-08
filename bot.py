@@ -122,6 +122,8 @@ def load_data() -> dict:
     data.setdefault("uids", {})
     data.setdefault("approved", [])
     data.setdefault("rejected", [])
+    data.setdefault("profiles", {})  # id -> {"u": ник, "n": имя}
+    data.setdefault("history", {})   # id -> {"date": ..., "items": [последние анализы за день]}
     return data
 
 
@@ -133,7 +135,7 @@ def save_data(data: dict) -> None:
 
 
 _restored = False  # True, когда база уже подтянута из хранилищ (или подтягивать нечего)
-_REG_KEYS = ("approved", "rejected", "uids")
+_REG_KEYS = ("approved", "rejected", "uids", "profiles")
 
 
 def _fernet():
@@ -204,6 +206,7 @@ async def push_repo_copy() -> None:
     payload = {k: data[k] for k in _REG_KEYS}
     payload["reg_ts"] = data.get("reg_ts", 0)
     payload["usage"] = {u: r for u, r in data["usage"].items() if r.get("date") == today()}  # только сегодняшний день
+    payload["history"] = {u: h for u, h in data["history"].items() if h.get("date") == today()}
     raw = json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
     if BACKUP_KEY:
         f = _fernet()
@@ -264,6 +267,18 @@ async def ensure_restored(bot) -> bool:
             for c in candidates:
                 uids.update(c.get("uids", {}))
             data["uids"] = uids
+            profiles = {}
+            for c in candidates:
+                profiles.update(c.get("profiles", {}))
+            data["profiles"] = profiles
+        # история анализов за сегодня: берём ту, где записей больше
+        for c in candidates:
+            for u, h in (c.get("history") or {}).items():
+                if h.get("date") != today():
+                    continue
+                cur = data["history"].get(u)
+                if not cur or cur.get("date") != today() or len(h.get("items", [])) > len(cur.get("items", [])):
+                    data["history"][u] = h
         # счётчик анализов: по каждому пользователю берём наибольшее значение за сегодня
         for c in candidates:
             for u, rec in (c.get("usage") or {}).items():
@@ -430,9 +445,185 @@ async def on_start(app) -> None:
     ]
 
 
+# ======================= ТАЙМЕР СДЕЛКИ =======================
+TF_SECONDS = {"15s": 15, "30s": 30, "1m": 60, "3m": 180, "5m": 300, "30m": 1800}
+_timers: dict = {}  # (chat_id, message_id) -> asyncio.Task
+
+
+def timer_line(left: float) -> str:
+    if left <= 0:
+        return "✅ <b>Время сделки вышло</b>"
+    m, sec = divmod(int(left + 0.999), 60)
+    return f"⏱ До конца сделки: <b>{m}:{sec:02d}</b>"
+
+
+def cancel_timer(chat_id: int, message_id: int) -> None:
+    task = _timers.pop((chat_id, message_id), None)
+    if task:
+        task.cancel()
+
+
+async def _timer_edit(bot, chat_id: int, message_id: int, is_photo: bool, text: str, kb) -> None:
+    try:
+        if is_photo:
+            await bot.edit_message_caption(
+                chat_id=chat_id, message_id=message_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb
+            )
+        else:
+            await bot.edit_message_text(
+                text, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.HTML,
+                reply_markup=kb, disable_web_page_preview=True,
+            )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def _run_timer(bot, chat_id, message_id, is_photo, base_text, kb, total, label) -> None:
+    end = time.time() + total
+    step = 3 if total <= 30 else 5 if total <= 180 else 10 if total <= 300 else 30
+    try:
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                break
+            await asyncio.sleep(min(step, left))
+            left = end - time.time()
+            if left <= 0:
+                break
+            await _timer_edit(bot, chat_id, message_id, is_photo, f"{base_text}\n{timer_line(left)}", kb)
+        await _timer_edit(bot, chat_id, message_id, is_photo, f"{base_text}\n{timer_line(0)}", kb)
+        if total >= 60:  # для длинных сделок — отдельное сообщение, чтобы пришло уведомление
+            note = await bot.send_message(chat_id, f"⏱ <b>Время вышло:</b> {escape(label)}", parse_mode=ParseMode.HTML)
+            await asyncio.sleep(20)
+            await note.delete()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.debug("Таймер остановлен: %s", e)
+    finally:
+        if _timers.get((chat_id, message_id)) is asyncio.current_task():
+            _timers.pop((chat_id, message_id), None)
+
+
+def start_timer(bot, ref, base_text: str, kb, total: int, label: str) -> None:
+    chat_id, message_id, is_photo = ref
+    cancel_timer(chat_id, message_id)
+    _timers[(chat_id, message_id)] = asyncio.create_task(
+        _run_timer(bot, chat_id, message_id, is_photo, base_text, kb, total, label)
+    )
+
+
+# ======================= КОМАНДЫ АДМИНА: /pending и /user =======================
+def _who(data: dict, uid: int) -> str:
+    p = data["profiles"].get(str(uid), {})
+    if p.get("u"):
+        return "@" + escape(p["u"])
+    return escape(p.get("n") or str(uid))
+
+
+def remember_profile(data: dict, user) -> bool:
+    """Запоминает ник и имя пользователя. Возвращает True, если что-то изменилось."""
+    new = {"u": user.username or "", "n": user.first_name or ""}
+    if data["profiles"].get(str(user.id)) != new:
+        data["profiles"][str(user.id)] = new
+        return True
+    return False
+
+
+def decision_kb(uid: int, approved: bool = False) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton("❌ Отозвать" if approved else "❌ Отклонить", callback_data=f"adm:no:{uid}")]
+    if not approved:
+        row.insert(0, InlineKeyboardButton("✅ Одобрить", callback_data=f"adm:ok:{uid}"))
+    return InlineKeyboardMarkup([row])
+
+
+async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await ensure_restored(context.bot)
+    data = load_data()
+    pend = [
+        int(u) for u in data["uids"]
+        if int(u) not in data["approved"] and int(u) not in data["rejected"]
+    ]
+    if not pend:
+        await update.message.reply_text("✅ Необработанных заявок нет.")
+        return
+    shown = pend[:10]
+    await update.message.reply_text(f"⏳ <b>Заявок в ожидании: {len(pend)}</b>", parse_mode=ParseMode.HTML)
+    for uid in shown:
+        await update.message.reply_text(
+            f"🆕 <b>Заявка</b>\n"
+            f"Пользователь: {_who(data, uid)} (<code>{uid}</code>)\n"
+            f"ID Pocket Option: <code>{escape(str(data['uids'][str(uid)]))}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=decision_kb(uid),
+        )
+    if len(pend) > len(shown):
+        await update.message.reply_text(f"…и ещё {len(pend) - len(shown)}. Обработайте эти и повторите /pending.")
+
+
+async def user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: <code>/user 123456789</code> или <code>/user @ник</code>", parse_mode=ParseMode.HTML)
+        return
+    await ensure_restored(context.bot)
+    data = load_data()
+    arg = context.args[0].strip()
+    uid = None
+    if arg.startswith("@"):
+        for u, p in data["profiles"].items():
+            if p.get("u", "").lower() == arg[1:].lower():
+                uid = int(u)
+                break
+    else:
+        try:
+            uid = int(arg)
+        except ValueError:
+            pass
+    if uid is None:
+        await update.message.reply_text("Пользователь не найден. Нужен числовой Telegram-ID или @ник человека, который уже писал боту.")
+        return
+
+    if uid in data["approved"]:
+        status = "✅ подтверждена"
+    elif uid in data["rejected"]:
+        status = "❌ отклонена"
+    elif str(uid) in data["uids"]:
+        status = "⏳ на проверке"
+    else:
+        status = "заявки не было"
+    tier = await user_tier(context.bot, uid)
+    sub = {"vip": "💎 VIP-канал", "free": "🆓 основной канал", "none": "🚫 не подписан"}[tier]
+    hist = data["history"].get(str(uid))
+    items = hist["items"] if hist and hist.get("date") == today() else []
+    last = "\n".join(
+        f"  {it['t']} · {escape(it['pair'])} · {it['tf']} · {'🟢' if it['dir'] == 'UP' else '🔴'}" for it in items[-5:][::-1]
+    ) or "  сегодня анализов не было"
+    text = (
+        "<b>👤 Карточка пользователя</b>\n"
+        f"{LINE}\n"
+        f"Пользователь: {_who(data, uid)}\n"
+        f"Telegram ID: <code>{uid}</code>\n"
+        f"ID Pocket Option: <code>{escape(str(data['uids'].get(str(uid), '—')))}</code>\n"
+        f"Регистрация: {status}\n"
+        f"Подписка: {sub}\n"
+        f"Анализов сегодня: <b>{used_today(data, uid)}</b>\n"
+        f"Последние анализы:\n{last}"
+    )
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=decision_kb(uid, approved=uid in data["approved"])
+    )
+
+
 async def backup_on_stop(app) -> None:
     """Перед остановкой (плановый перезапуск раз в ~6 часов) сохраняем свежую копию."""
     for t in app.bot_data.get("tasks", []):
+        t.cancel()
+    for t in list(_timers.values()):
         t.cancel()
     await backup_data(app.bot)
 
@@ -699,9 +890,12 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("👤 Профиль", callback_data="status"),
-                InlineKeyboardButton("🔗 Регистрация", callback_data="ref"),
+                InlineKeyboardButton("📜 История", callback_data="history"),
             ],
-            [InlineKeyboardButton("💬 Поддержка", url=f"https://t.me/Terret911")],
+            [
+                InlineKeyboardButton("🔗 Регистрация", callback_data="ref"),
+                InlineKeyboardButton("💬 Поддержка", url=f"https://t.me/Terret911"),
+            ],
         ]
     )
 
@@ -783,31 +977,37 @@ async def analyze_with_loading(q, pair: str, tf_name: str, ticker, tf: str, last
 
 
 async def show_photo(q, path: str, text: str, kb: InlineKeyboardMarkup):
-    """Показывает фото с подписью. Если файла нет — обычный текст."""
+    """Показывает фото с подписью. Если файла нет — обычный текст.
+    Возвращает (chat_id, message_id, is_photo) итогового сообщения или None."""
     if not os.path.exists(path):
         await safe_edit(q, text, kb)
-        return
+        if q.message is not None and not q.message.photo:
+            return (q.message.chat_id, q.message.message_id, False)
+        return None
     if q.message is not None and q.message.photo:
         try:
             with open(path, "rb") as f:
-                await q.edit_message_media(
+                res = await q.edit_message_media(
                     InputMediaPhoto(f, caption=text, parse_mode=ParseMode.HTML), reply_markup=kb
                 )
+            m = res if hasattr(res, "message_id") else q.message
+            return (m.chat_id, m.message_id, True)
         except BadRequest as e:
             if "not modified" not in str(e).lower():
                 raise
-        return
+            return (q.message.chat_id, q.message.message_id, True)
     with open(path, "rb") as f:
-        await q.message.chat.send_photo(f, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        msg = await q.message.chat.send_photo(f, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
     try:
         await q.message.delete()
     except Exception:
         pass
+    return (msg.chat_id, msg.message_id, True)
 
 
 async def show_result(q, text: str, kb: InlineKeyboardMarkup, direction: str):
     """Результат анализа с фото: зелёное для ВВЕРХ, красное для ВНИЗ."""
-    await show_photo(q, IMG_UP if direction == "UP" else IMG_DOWN, text, kb)
+    return await show_photo(q, IMG_UP if direction == "UP" else IMG_DOWN, text, kb)
 
 
 # ======================= КОМАНДЫ =======================
@@ -820,6 +1020,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             LOCKED, parse_mode=ParseMode.HTML, reply_markup=subscribe_keyboard()
         )
         return
+    _d = load_data()
+    if remember_profile(_d, update.effective_user):
+        save_data(_d)
     if os.path.exists(IMG_WELCOME):
         with open(IMG_WELCOME, "rb") as f:
             await update.message.reply_photo(f, caption=WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu())
@@ -848,6 +1051,7 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Ваша регистрация уже подтверждена, повторно отправлять ID не нужно.")
         return
     data["uids"][str(user.id)] = uid
+    remember_profile(data, user)
     if user.id in data["rejected"]:
         data["rejected"].remove(user.id)
     mark_registration_changed(data)
@@ -955,6 +1159,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data.startswith("sig:") and user.id in _busy:
         await q.answer("⏳ Анализ уже идёт, подождите несколько секунд")
         return
+    if q.message is not None:
+        cancel_timer(q.message.chat_id, q.message.message_id)  # таймер старого результата больше не нужен
     await q.answer()
 
     if q.data.startswith("adm:"):
@@ -1027,6 +1233,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Открыть Pocket Option", url=REF_LINK)], back_row()])
         await safe_edit(q, text, kb)
+
+    elif action == "history":
+        hist = data["history"].get(str(user.id))
+        items = hist["items"] if hist and hist.get("date") == today() else []
+        if items:
+            lines = [
+                f"{i}. <code>{it['t']}</code> · {escape(it['pair'])} · {it['tf']} · "
+                f"{'🟢 ВВЕРХ' if it['dir'] == 'UP' else '🔴 ВНИЗ'} ({it['score']:+d})"
+                for i, it in enumerate(items[::-1][:15], 1)
+            ]
+            body = "\n".join(lines)
+        else:
+            body = "Сегодня анализов ещё не было."
+        await safe_edit(
+            q,
+            f"<b>📜 История за сегодня</b>\n{LINE}\n{body}\n{LINE}\n<i>Показаны последние анализы, новые сверху.</i>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("📊 Анализ рынка", callback_data="pairs")], back_row()]),
+        )
 
     elif action == "status":
         if tier == "vip":
@@ -1162,6 +1386,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rec = {"date": today(), "count": 0}
         rec["count"] += 1
         data["usage"][str(user.id)] = rec
+        hist = data["history"].get(str(user.id))
+        if not hist or hist.get("date") != today():
+            hist = {"date": today(), "items": []}
+        hist["items"].append(
+            {"t": datetime.now(TZ).strftime("%H:%M"), "pair": pair, "tf": tf_name, "dir": res["direction"], "score": res["score"]}
+        )
+        hist["items"] = hist["items"][-20:]
+        data["history"][str(user.id)] = hist
         save_data(data)
         global _usage_dirty
         _usage_dirty = True
@@ -1213,7 +1445,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ],
             ]
         )
-        await show_result(q, text, kb, res["direction"])
+        total = TF_SECONDS[tf]
+        ref = await show_result(q, f"{text}\n{timer_line(total)}", kb, res["direction"])
+        if ref:
+            start_timer(context.bot, ref, text, kb, total, f"{pair} · {tf_name}")
 
 
 def main():
@@ -1222,6 +1457,8 @@ def main():
     app.add_handler(CommandHandler("uid", uid_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("reject", reject_cmd))
+    app.add_handler(CommandHandler("pending", pending_cmd))
+    app.add_handler(CommandHandler("user", user_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.run_polling()
 
