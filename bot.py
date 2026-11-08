@@ -8,6 +8,7 @@ import random
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from datetime import datetime
 from html import escape
 from zoneinfo import ZoneInfo
@@ -43,6 +44,10 @@ GITHUB_BRANCH = os.getenv("GITHUB_REF_NAME", "main")
 CACHE_TTL = 45  # секунд (кэш котировок)
 ALT_PROB = 0.5   # вероятность, что направление сменится на противоположное предыдущему (0 = только естественный шанс 50%; 1 = всегда меняется)
 LOAD_MIN, LOAD_MAX = 5, 10  # длительность «анализа» в секундах
+USAGE_SYNC_SEC = 900   # как часто (если были анализы) сохранять счётчик анализов в репозиторий
+SUB_CHECK_SEC = 1800   # как часто проверять, что пользователи не отписались от канала
+# защита от спама: не больше FLOOD_MAX нажатий за FLOOD_WINDOW секунд, иначе блок на MUTE_SEC секунд
+FLOOD_WINDOW, FLOOD_MAX, MUTE_SEC, MIN_GAP = 5.0, 8, 30, 0.5
 NOISE = 0.6     # «случайность» голосов: чем больше, тем сильнее результат меняется при обновлении
 
 
@@ -198,6 +203,7 @@ async def push_repo_copy() -> None:
     data = load_data()
     payload = {k: data[k] for k in _REG_KEYS}
     payload["reg_ts"] = data.get("reg_ts", 0)
+    payload["usage"] = {u: r for u, r in data["usage"].items() if r.get("date") == today()}  # только сегодняшний день
     raw = json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
     if BACKUP_KEY:
         f = _fernet()
@@ -258,6 +264,14 @@ async def ensure_restored(bot) -> bool:
             for c in candidates:
                 uids.update(c.get("uids", {}))
             data["uids"] = uids
+        # счётчик анализов: по каждому пользователю берём наибольшее значение за сегодня
+        for c in candidates:
+            for u, rec in (c.get("usage") or {}).items():
+                if rec.get("date") != today():
+                    continue
+                cur = data["usage"].get(u)
+                if not cur or cur.get("date") != today() or rec.get("count", 0) > cur.get("count", 0):
+                    data["usage"][u] = rec
         save_data(data)
         log.info("База восстановлена: подтверждённых %d", len(data["approved"]))
 
@@ -290,8 +304,136 @@ async def backup_data(bot) -> None:
     await push_repo_copy()
 
 
+_usage_dirty = False  # были анализы, которые ещё не записаны в репозиторий
+
+
+async def usage_sync_loop() -> None:
+    """Раз в USAGE_SYNC_SEC сохраняет счётчик анализов в репозиторий (если он менялся)."""
+    global _usage_dirty
+    while True:
+        await asyncio.sleep(USAGE_SYNC_SEC)
+        if _usage_dirty and _restored:
+            _usage_dirty = False
+            await push_repo_copy()
+
+
+# ======================= АВТОПРОВЕРКА ПОДПИСКИ =======================
+_unsub: set = set()
+_sub_baseline = False  # первый проход молча запоминает, кто уже не подписан
+
+
+async def _member_or_none(bot, chat_id: int, user_id: int):
+    """True/False — статус подписки, None — не удалось узнать (ошибка сети и т. п.)."""
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in ("member", "administrator", "creator") or (
+            m.status == "restricted" and getattr(m, "is_member", False)
+        )
+    except Exception:
+        return None
+
+
+async def check_subscriptions(bot) -> None:
+    global _sub_baseline
+    data = load_data()
+    users = set(data["approved"]) | {int(u) for u in data["uids"]} | {int(u) for u in data["usage"]}
+    users.discard(ADMIN_ID)
+    for uid in sorted(users):
+        st_free = await _member_or_none(bot, FREE_CHANNEL_ID, uid)
+        st_vip = await _member_or_none(bot, VIP_CHANNEL_ID, uid)
+        subscribed = bool(st_free) or bool(st_vip)
+        if not subscribed and (st_free is None or st_vip is None):
+            continue  # не уверены (ошибка запроса) — ничего не делаем
+        if not subscribed and uid not in _unsub:
+            _unsub.add(uid)
+            if _sub_baseline:
+                try:
+                    await bot.send_message(
+                        uid,
+                        "<b>⚠️ Подписка не найдена</b>\n"
+                        f"{LINE}\n"
+                        "Вы не подписаны на канал, поэтому доступ к боту закрыт.\n"
+                        "Подпишитесь и нажмите «Проверить подписку».",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=subscribe_keyboard(),
+                    )
+                except Exception:
+                    pass
+        elif subscribed and uid in _unsub:
+            _unsub.discard(uid)
+            if _sub_baseline:
+                try:
+                    await bot.send_message(uid, "✅ Подписка восстановлена, доступ к боту снова открыт. Нажмите /start.")
+                except Exception:
+                    pass
+        await asyncio.sleep(0.1)  # не упираемся в лимиты Telegram
+    _sub_baseline = True
+
+
+async def subscription_watch_loop(bot) -> None:
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await check_subscriptions(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("Автопроверка подписки не удалась: %s", e)
+        await asyncio.sleep(SUB_CHECK_SEC)
+
+
+# ======================= ЗАЩИТА ОТ СПАМА =======================
+_hits: dict = {}
+_muted_until: dict = {}
+_cmd_last: dict = {}
+_busy: set = set()  # пользователи, у которых прямо сейчас идёт анализ
+
+
+def flood_check(uid: int) -> str | None:
+    """Возвращает текст предупреждения, если нажатие нужно проигнорировать."""
+    if uid == ADMIN_ID:
+        return None
+    now = time.time()
+    until = _muted_until.get(uid, 0)
+    if until > now:
+        return f"🚫 Слишком много нажатий. Подождите {int(until - now) + 1} сек."
+    dq = _hits.setdefault(uid, deque())
+    while dq and now - dq[0] > FLOOD_WINDOW:
+        dq.popleft()
+    dq.append(now)
+    if len(dq) > FLOOD_MAX:
+        _muted_until[uid] = now + MUTE_SEC
+        dq.clear()
+        return f"🚫 Слишком много нажатий. Подождите {MUTE_SEC} сек."
+    if len(dq) >= 2 and now - dq[-2] < MIN_GAP:
+        return "⏳ Не так быстро"
+    return None
+
+
+def cmd_ok(uid: int, key: str, seconds: float) -> bool:
+    """Ограничение частоты команд: не чаще одного раза в `seconds` секунд."""
+    if uid == ADMIN_ID:
+        return True
+    now = time.time()
+    if now - _cmd_last.get((uid, key), 0) < seconds:
+        return False
+    _cmd_last[(uid, key)] = now
+    return True
+
+
+async def on_start(app) -> None:
+    """Запуск: восстановить базу и включить фоновые задачи."""
+    await ensure_restored(app.bot)
+    app.bot_data["tasks"] = [
+        asyncio.create_task(usage_sync_loop()),
+        asyncio.create_task(subscription_watch_loop(app.bot)),
+    ]
+
+
 async def backup_on_stop(app) -> None:
     """Перед остановкой (плановый перезапуск раз в ~6 часов) сохраняем свежую копию."""
+    for t in app.bot_data.get("tasks", []):
+        t.cancel()
     await backup_data(app.bot)
 
 
@@ -670,6 +812,8 @@ async def show_result(q, text: str, kb: InlineKeyboardMarkup, direction: str):
 
 # ======================= КОМАНДЫ =======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not cmd_ok(update.effective_user.id, "start", 2):
+        return
     tier = await user_tier(context.bot, update.effective_user.id)
     if tier == "none":
         await update.message.reply_text(
@@ -694,6 +838,9 @@ async def uid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     user = update.effective_user
+    if not cmd_ok(user.id, "uid", 20):
+        await update.message.reply_text("⏳ Подождите немного перед повторной отправкой.")
+        return
     uid = context.args[0][:32]
     await ensure_restored(context.bot)
     data = load_data()
@@ -799,8 +946,16 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ======================= КНОПКИ =======================
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     user = q.from_user
+
+    warn = flood_check(user.id)
+    if warn:
+        await q.answer(warn, show_alert=warn.startswith("🚫"))
+        return
+    if q.data.startswith("sig:") and user.id in _busy:
+        await q.answer("⏳ Анализ уже идёт, подождите несколько секунд")
+        return
+    await q.answer()
 
     if q.data.startswith("adm:"):
         if user.id != ADMIN_ID:
@@ -979,11 +1134,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tf_name, expiry, _ = TIMEFRAMES[tf]
+        if user.id in _busy:  # проверка и добавление без await между ними, параллельный анализ невозможен
+            return
+        _busy.add(user.id)
         try:
             res = await analyze_with_loading(q, pair, tf_name, PAIRS[pair], tf, _last_dir.get(user.id, 0))
         except Exception as e:
             log.exception("analysis failed: %s", e)
             res = None
+        finally:
+            _busy.discard(user.id)
 
         back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Другая пара", callback_data=f"list:{pair_kind(pair)}")], back_row()])
 
@@ -1003,6 +1163,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rec["count"] += 1
         data["usage"][str(user.id)] = rec
         save_data(data)
+        global _usage_dirty
+        _usage_dirty = True
 
         _last_dir[user.id] = 1 if res["direction"] == "UP" else -1
         p = res["price"]
@@ -1055,7 +1217,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(restore_data).post_stop(backup_on_stop).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_start).post_stop(backup_on_stop).build()
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("uid", uid_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
