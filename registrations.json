@@ -20,7 +20,7 @@
  "usage": {
   "6239904209": {
    "date": "2026-11-10",
-   "count": 1
+   "count": 6
   }
  },
  "history": {
@@ -31,6 +31,41 @@
      "t": "10:08",
      "pair": "EUR/CHF OTC",
      "tf": "30S",
+     "dir": "DOWN",
+     "score": -1
+    },
+    {
+     "t": "16:06",
+     "pair": "EUR/USD OTC",
+     "tf": "15S",
+     "dir": "DOWN",
+     "score": -3
+    },
+    {
+     "t": "16:08",
+     "pair": "USD/IDR OTC",
+     "tf": "15S",
+     "dir": "UP",
+     "score": 1
+    },
+    {
+     "t": "16:10",
+     "pair": "AUD/CHF OTC",
+     "tf": "15S",
+     "dir": "DOWN",
+     "score": -1
+    },
+    {
+     "t": "16:11",
+     "pair": "EUR/USD OTC",
+     "tf": "15S",
+     "dir": "UP",
+     "score": 1
+    },
+    {
+     "t": "16:13",
+     "pair": "USD/IDR OTC",
+     "tf": "15S",
      "dir": "DOWN",
      "score": -1
     }
