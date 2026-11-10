@@ -10,9 +10,31 @@
   "6568578275": {
    "u": "Wolksvagenpolo",
    "n": "□black_Drift◇"
+  },
+  "6239904209": {
+   "u": "Terret911",
+   "n": "Terret"
   }
  },
  "reg_ts": 1793736181.5346951,
- "usage": {},
- "history": {}
+ "usage": {
+  "6239904209": {
+   "date": "2026-11-10",
+   "count": 1
+  }
+ },
+ "history": {
+  "6239904209": {
+   "date": "2026-11-10",
+   "items": [
+    {
+     "t": "10:08",
+     "pair": "EUR/CHF OTC",
+     "tf": "30S",
+     "dir": "DOWN",
+     "score": -1
+    }
+   ]
+  }
+ }
 }
