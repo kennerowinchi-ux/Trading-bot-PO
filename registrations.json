@@ -24,7 +24,7 @@
  "usage": {
   "6239904209": {
    "date": "2026-11-20",
-   "count": 3
+   "count": 4
   }
  },
  "history": {
@@ -51,6 +51,13 @@
      "tf": "M3",
      "dir": "DOWN",
      "score": -1
+    },
+    {
+     "t": "15:16",
+     "pair": "AED/CNY OTC",
+     "tf": "30S",
+     "dir": "UP",
+     "score": 1
     }
    ]
   }
