@@ -24,7 +24,7 @@
  "usage": {
   "6239904209": {
    "date": "2026-11-20",
-   "count": 2
+   "count": 3
   }
  },
  "history": {
@@ -44,6 +44,13 @@
      "tf": "M3",
      "dir": "UP",
      "score": 1
+    },
+    {
+     "t": "14:52",
+     "pair": "EUR/USD",
+     "tf": "M3",
+     "dir": "DOWN",
+     "score": -1
     }
    ]
   }
