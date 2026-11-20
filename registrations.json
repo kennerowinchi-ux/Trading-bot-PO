@@ -21,45 +21,6 @@
   }
  },
  "reg_ts": 1793736181.5346951,
- "usage": {
-  "6239904209": {
-   "date": "2026-11-20",
-   "count": 4
-  }
- },
- "history": {
-  "6239904209": {
-   "date": "2026-11-20",
-   "items": [
-    {
-     "t": "14:40",
-     "pair": "AED/CNY OTC",
-     "tf": "30S",
-     "dir": "UP",
-     "score": 1
-    },
-    {
-     "t": "14:42",
-     "pair": "EUR/USD",
-     "tf": "M3",
-     "dir": "UP",
-     "score": 1
-    },
-    {
-     "t": "14:52",
-     "pair": "EUR/USD",
-     "tf": "M3",
-     "dir": "DOWN",
-     "score": -1
-    },
-    {
-     "t": "15:16",
-     "pair": "AED/CNY OTC",
-     "tf": "30S",
-     "dir": "UP",
-     "score": 1
-    }
-   ]
-  }
- }
+ "usage": {},
+ "history": {}
 }
